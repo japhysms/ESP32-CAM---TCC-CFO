@@ -978,6 +978,7 @@ function consorcioCard(c) {
       <div><span class="label">Encerramento</span><strong>${s.endYm ? monthLabel(s.endYm) : '—'}</strong><span class="muted small">faltam ${monthsText(s.total - s.paid)}</span></div>
     </div>
     <p class="small muted">Taxa de administração ${fmtRate(c.adminFee)} · fundo de reserva ${fmtRate(c.reserveFund)}${+c.insurance ? ` · seguro ${fmtRate(c.insurance)} a.m.` : ''}${+c.adjust ? ` · reajuste estimado ${fmtRate(c.adjust)} a.a.` : ''}</p>
+    ${!c.contemplated ? `<div class="toolbar"><button class="btn small primary" data-action="open-cons" data-id="${c.id}">🎯 Estratégia de contemplação</button></div>` : ''}
     ${!c.contemplated && s.next ? `<div class="sim"><h3>🎯 Simular lance</h3>
       <div class="toolbar"><label class="field">Lance (% da carta)<input type="number" min="0" max="100" step="1" data-input="sim-cons" data-field="bid" data-id="${c.id}" value="${esc(SIM[c.id]?.bid || '')}"></label>
         <label class="field">Lance embutido (%)<input type="number" min="0" max="30" step="1" data-input="sim-cons" data-field="emb" data-id="${c.id}" value="${esc(SIM[c.id]?.emb || '')}"></label></div>
@@ -1113,10 +1114,215 @@ function viewSimulator() {
     <tbody>${yr.join('')}</tbody></table></div>
     <p class="small muted">Simulação sem TR e com seguros fixos — use "🏦 Atualizar pelos dados do banco" para partir do saldo real. Confirme as regras de amortização e uso do FGTS com o banco.</p></div>`;
 
-  return head + hero + `<div class="grid two">${builder}${compare}</div>` + charts + table;
+  return head + hero + financingStrategy(d, r) + `<div class="grid two mt">${builder}${compare}</div>` + charts + table;
+}
+
+/* ---------- inteligência: dados de mercado, estratégias de quitação e de contemplação ---------- */
+const MARKET_KEY = 'minhas-financas.market';
+let market = (() => { try { return JSON.parse(localStorage.getItem(MARKET_KEY)) || {}; } catch { return {}; } })();
+async function fetchMarket(force = false) {
+  if (!force && market.at && Date.now() - market.at < 12 * 3600e3) return;
+  try {
+    const r = await fetch('https://api.bcb.gov.br/dados/serie/bcdata.sgs.4389/dados/ultimos/1?formato=json');
+    const j = await r.json();
+    const v = parseFloat(String(j[0].valor).replace(',', '.'));
+    if (v > 0) {
+      market = { cdi: v, cdiDate: j[0].data, at: Date.now() };
+      try { localStorage.setItem(MARKET_KEY, JSON.stringify(market)); } catch { /* */ }
+      if (ui.sim || ui.cons) render();
+    }
+  } catch { /* sem internet ou bloqueado: usa o valor manual */ }
+}
+function avgMonthly(n = 3) {
+  const ms = Array.from({ length: n }, (_, i) => monthSummary(addMonths(currentMonth(), -i - 1)));
+  return { surplus: sum(ms, m => m.resultado) / n, desp: sum(ms, m => m.despesas) / n };
+}
+const liquidBalance = () => sum(state.accounts.filter(a => a.type === 'corrente'), a => accountBalance(a));
+const fmtPctNum = v => (v == null || !isFinite(v) ? '—' : String(Math.round(v * 100) / 100).replace('.', ',') + '%');
+
+function requiredMonthly(d, from, target) {
+  const ok = v => { const r = planResult(d, [{ value: v, every: 1, start: from, mode: 'prazo' }]); return r && r.P.end <= target; };
+  let lo = 0, hi = financingStatus(d).saldo;
+  if (!ok(hi)) return null;
+  for (let k = 0; k < 32; k++) { const mid = (lo + hi) / 2; if (ok(mid)) hi = mid; else lo = mid; }
+  return Math.ceil(hi / 10) * 10;
+}
+function fgtsNext(d, from) {
+  const last = d.strategy?.fgtsLast;
+  const next = last ? addMonths(last, 24) : from;
+  return next < from ? from : next;
+}
+function strategyScenarios(d, from) {
+  const g = d.strategy || {};
+  const av = avgMonthly(3);
+  const sugg = Math.max(0, Math.floor((av.surplus * 0.5) / 50) * 50);
+  const B = g.budget !== undefined && g.budget !== '' ? +g.budget : sugg;
+  if (!(B > 0)) return { B, sugg, list: [] };
+  const dec = from.slice(5) === '12' ? from : `${from.slice(0, 4)}-12`;
+  const fg = +g.fgtsBalance > 0 ? [{ value: +g.fgtsBalance, every: 24, start: fgtsNext(d, from), mode: 'prazo' }] : [];
+  const list = [
+    { key: 'mp', label: `${fmt(B)} todo mês, reduzindo o prazo`, items: [{ value: B, every: 1, start: from, mode: 'prazo' }] },
+    { key: 'mc', label: `${fmt(B)} todo mês, reduzindo a parcela`, items: [{ value: B, every: 1, start: from, mode: 'parcela' }] },
+    { key: 'an', label: `${fmt(B * 12)} uma vez por ano (junta e amortiza em dezembro)`, items: [{ value: B * 12, every: 12, start: dec, mode: 'prazo' }] },
+  ];
+  if (fg.length) list.push({ key: 'fg', label: `${fmt(B)} todo mês + FGTS a cada 2 anos`, items: [list[0].items[0], ...fg] });
+  list.forEach(x => { x.res = planResult(d, x.items); });
+  const best = list.reduce((a, b) => (b.res.saved > a.res.saved ? b : a));
+  best.best = true;
+  return { B, sugg, list };
+}
+
+function financingStrategy(d, r) {
+  const g = d.strategy || {};
+  const v = (k, def) => (g[k] === undefined || g[k] === '' ? def : g[k]);
+  const cdi = +v('cdi', market.cdi || 0), cdiPct = +v('cdiPct', 100), ir = +v('ir', 15), tr = +v('tr', 0);
+  const inp = (field, label, val, type = 'number', attrs = 'step="any"') => `<label class="field">${label}<input type="${type}" ${attrs} data-change="fs" data-id="${d.id}" data-field="${field}" value="${esc(val ?? '')}"></label>`;
+
+  const fin = ((1 + (+d.rate || 0) / 100) * (1 + tr / 100) - 1) * 100;
+  const net = cdi ? (cdi * cdiPct) / 100 * (1 - ir / 100) : null;
+  const verdict = net == null ? '<span class="muted">Informe o CDI para comparar.</span>'
+    : fin > net + 0.3 ? `✅ <strong>Amortizar compensa.</strong> Cada real amortizado “rende” <strong>${fmtPctNum(fin)} a.a.</strong> sem IR e sem risco, contra <strong>${fmtPctNum(net)}</strong> líquidos investindo.`
+    : net > fin + 0.3 ? `📈 <strong>Investir rende mais</strong> (${fmtPctNum(net)} líquidos × ${fmtPctNum(fin)} do financiamento). Amortize com o FGTS (rende bem menos) e só com o que passar da reserva, se quiser a tranquilidade de quitar antes.`
+    : `⚖️ <strong>Empate técnico</strong> (${fmtPctNum(fin)} × ${fmtPctNum(net)}). Decida pela segurança: amortizar reduz risco; investir mantém liquidez.`;
+
+  const av = avgMonthly(3), liquid = liquidBalance();
+  const months = av.desp ? liquid / av.desp : null;
+  const reserve = months == null ? '<span class="muted">Sem despesas registradas nos últimos 3 meses.</span>'
+    : months < 6 ? `⚠️ Você tem <strong>${fmt(liquid)}</strong> em conta ≈ <strong>${months.toFixed(1).replace('.', ',')} meses</strong> de despesas. Antes de amortizar com dinheiro do caixa, complete 6 meses (faltam <strong>${fmt(6 * av.desp - liquid)}</strong>). FGTS pode ser usado normalmente.`
+    : `✅ Reserva de <strong>${months.toFixed(1).replace('.', ',')} meses</strong>. O que passa de 6 meses (<strong>${fmt(liquid - 6 * av.desp)}</strong>) pode ir para amortização. <button class="btn small soft" data-action="fs-add" data-id="${d.id}" data-value="${Math.floor((liquid - 6 * av.desp) / 100) * 100}" data-every="0">+ Amortizar esse excedente</button>`;
+
+  const target = g.target || '';
+  let targetOut = '<span class="muted">Escolha até quando quer quitar.</span>';
+  if (target) {
+    if (target >= r.A.end) targetOut = `Pelo contrato você já quita em ${monthLabel(r.A.end)}, antes da meta. 🎉`;
+    else { const m = requiredMonthly(d, r.from, target); targetOut = m == null ? 'Meta curta demais para o saldo atual.' : `Para quitar até <strong>${monthLabel(target)}</strong>, amortize cerca de <strong class="pos">${fmt(m)} por mês</strong> (reduzindo prazo). <button class="btn small soft" data-action="fs-add" data-id="${d.id}" data-value="${m}" data-every="1">+ Adicionar ao plano</button>`; }
+  }
+
+  const fNext = fgtsNext(d, r.from);
+  const fgtsOut = `Você pode usar o FGTS para amortizar a partir de <strong>${monthLabel(fNext)}</strong> (a cada 24 meses). O FGTS rende pouco (≈3% a.a. + TR), então usá-lo para amortizar quase sempre compensa.
+    ${+g.fgtsBalance > 0 ? `<button class="btn small soft" data-action="fs-add" data-id="${d.id}" data-value="${+g.fgtsBalance}" data-every="24" data-start="${fNext}">+ FGTS a cada 2 anos no plano</button>` : ''}`;
+
+  const sc = strategyScenarios(d, r.from);
+  const scTable = sc.list.length ? `<div class="table-wrap"><table><thead><tr><th>Estratégia</th><th class="num">Quitação</th><th class="num">Juros economizados</th><th class="num">Próx. parcela</th><th></th></tr></thead><tbody>
+    ${sc.list.map(x => `<tr class="${x.best ? 'best' : ''}"><td>${x.best ? '🏆 ' : ''}${esc(x.label)}</td><td class="num">${monthLabel(x.res.P.end)}</td><td class="num pos"><strong>${fmt(x.res.saved)}</strong></td><td class="num">${fmt(x.res.P.next)}</td>
+      <td><button class="btn small ${x.best ? 'primary' : ''}" data-action="fs-use" data-id="${d.id}" data-scn="${x.key}">Usar no plano</button></td></tr>`).join('')}</tbody></table></div>` : '<p class="muted small">Informe um valor mensal para comparar as estratégias.</p>';
+
+  return `<div class="card strat"><h2>🧠 Estratégias para quitar mais rápido</h2>
+    <div class="sub">análises automáticas com seus dados · ${market.cdi ? `CDI ${fmtPctNum(market.cdi)} a.a. (Banco Central, ${esc(market.cdiDate)})` : 'CDI: informe manualmente'} <button class="btn small ghost" data-action="market-refresh">↻</button></div>
+    <div class="strat-grid">
+      <div class="strat-box"><h3>1. Amortizar ou investir?</h3>
+        <div class="toolbar">${inp('cdi', 'CDI % a.a.', v('cdi', market.cdi || ''))}${inp('cdiPct', '% do CDI', cdiPct)}${inp('ir', 'IR %', ir)}${inp('tr', 'TR estimada % a.a.', tr)}</div>
+        <p>${verdict}</p></div>
+      <div class="strat-box"><h3>2. Reserva de emergência</h3><p>${reserve}</p></div>
+      <div class="strat-box"><h3>3. Meta de quitação</h3>
+        <div class="toolbar">${inp('target', 'Quero quitar até', target, 'month', `min="${r.from}"`)}</div><p>${targetOut}</p></div>
+      <div class="strat-box"><h3>4. FGTS</h3>
+        <div class="toolbar">${inp('fgtsLast', 'Último uso para amortizar', g.fgtsLast || '', 'month', '')}${inp('fgtsBalance', 'Saldo FGTS disponível (R$)', g.fgtsBalance ?? '')}</div><p>${fgtsOut}</p></div>
+      <div class="strat-box full"><h3>5. Melhor forma de usar o que sobra por mês</h3>
+        <div class="toolbar">${inp('budget', 'Quanto posso destinar por mês (R$)', v('budget', sc.sugg || ''))}<span class="small muted">sugestão: metade da sua sobra média dos últimos 3 meses (${fmt(av.surplus)})</span></div>
+        ${scTable}</div>
+    </div></div>`;
+}
+
+function consStrategyData(c) {
+  const s = consorcioStatus(c), g = c.strategy || {};
+  const v = (k, def) => (g[k] === undefined || g[k] === '' ? def : g[k]);
+  const base = v('bidBase', 'carta') === 'saldo' ? s.remaining : s.creditNow;
+  const hist = String(v('history', '')).split(/[\s;]+/).map(x => parseFloat(x.replace(',', '.'))).filter(x => x > 0 && x <= 100);
+  const sorted = [...hist].sort((a, b) => a - b);
+  const q = pq => (sorted.length ? sorted[Math.min(sorted.length - 1, Math.round(pq * (sorted.length - 1)))] : null);
+  const embMax = +v('embMax', 30), saved = +v('saved', 0), saving = +v('saving', 0), fgts = g.imovel ? +v('fgts', 0) : 0;
+  const embR = (s.creditNow * embMax) / 100;
+  const power = base ? ((saved + fgts + embR) / base) * 100 : 0;
+  const rec = sorted.length ? Math.min(100, Math.ceil(q(0.75) + 1)) : null;
+  return { s, g, v, base, hist, sorted, med: q(0.5), min: sorted[0], max: sorted[sorted.length - 1], rec, embMax, embR, saved, saving, fgts, power };
+}
+
+function viewConsStrategy() {
+  const c = state.debts.find(x => x.id === ui.cons);
+  if (!c) { ui.cons = null; return viewDebts(); }
+  const k = consStrategyData(c); const { s, g, v } = k;
+  const inp = (field, label, val, attrs = 'step="any" min="0"') => `<label>${label}<input type="number" ${attrs} data-change="cs" data-id="${c.id}" data-field="${field}" value="${esc(val ?? '')}"></label>`;
+  const head = `<div class="page-head"><div><button class="btn small ghost" data-action="close-cons">← Voltar</button>
+    <h1>Estratégia de contemplação</h1><p>${esc(c.name)} · ${esc(c.institution || '')} · carta ${fmt(s.creditNow)} · ${s.paid}/${s.total} parcelas pagas</p></div></div>`;
+  if (c.contemplated) return head + '<div class="card empty-state"><h2>Já contemplado 🎉</h2></div>';
+
+  const form = `<div class="card"><h2>Dados do grupo</h2><div class="sub">peça à administradora (app, extrato ou atendimento) e atualize de vez em quando</div>
+    <div class="form-grid">
+      ${inp('members', 'Cotas no grupo', v('members', ''), 'step="1" min="0"')}
+      ${inp('day', 'Dia da assembleia', v('day', ''), 'step="1" min="1" max="31"')}
+      ${inp('draws', 'Contemplações por sorteio/mês', v('draws', 1), 'step="1" min="0"')}
+      ${inp('bids', 'Contemplações por lance/mês', v('bids', 1), 'step="1" min="0"')}
+      <label class="full">Lances vencedores recentes (% — separe por espaço ou ;)
+        <textarea rows="2" data-change="cs" data-id="${c.id}" data-field="history" placeholder="38; 41,5; 35; 44; 40">${esc(v('history', ''))}</textarea></label>
+      <label>O lance é calculado sobre<select data-change="cs" data-id="${c.id}" data-field="bidBase"><option value="carta">a carta de crédito</option><option value="saldo" ${v('bidBase', 'carta') === 'saldo' ? 'selected' : ''}>o saldo devedor</option></select></label>
+      ${inp('embMax', 'Lance embutido máximo permitido (%)', k.embMax)}
+      ${inp('saved', 'Quanto já guardei para o lance (R$)', v('saved', ''))}
+      ${inp('saving', 'Quanto consigo guardar por mês (R$)', v('saving', ''))}
+      <label class="check full"><input type="checkbox" data-change="cs" data-id="${c.id}" data-field="imovel" ${g.imovel ? 'checked' : ''}> Consórcio de imóvel (permite usar FGTS no lance)</label>
+      ${g.imovel ? inp('fgts', 'Saldo FGTS disponível (R$)', v('fgts', '')) : ''}
+    </div></div>`;
+
+  // sorteio
+  const members = +v('members', 0), draws = +v('draws', 1), bids = +v('bids', 1), per = draws + bids;
+  let sortOut = '<span class="muted">Informe quantas cotas tem o grupo.</span>';
+  if (members && draws) {
+    const rem = Math.max(1, members - s.paid * per);
+    let none = 1; for (let i = 0; i < 12; i++) none *= 1 - Math.min(1, draws / Math.max(1, rem - i * per));
+    sortOut = `Na próxima assembleia: <strong>${pct(Math.min(1, draws / rem))}</strong> · em 12 meses: <strong>${pct(1 - none)}</strong><br><span class="muted small">estimando ~${rem} cotas ainda não contempladas</span>`;
+  }
+  // histórico
+  let histOut = '<span class="muted">Cole os percentuais dos lances vencedores das últimas assembleias.</span>';
+  if (k.sorted.length) {
+    const h = k.hist, last3 = h.slice(-3), prev = h.slice(0, -3);
+    const trend = prev.length ? sum(last3) / last3.length - sum(prev) / prev.length : 0;
+    histOut = `${k.sorted.length} assembleias · menor <strong>${fmtPctNum(k.min)}</strong> · mediana <strong>${fmtPctNum(k.med)}</strong> · maior <strong>${fmtPctNum(k.max)}</strong>
+      ${prev.length ? `<br>Tendência: ${trend > 1 ? `📈 subindo (+${fmtPctNum(trend)} nas últimas 3)` : trend < -1 ? `📉 caindo (${fmtPctNum(trend)} nas últimas 3)` : '➡️ estável'}` : ''}
+      <br>🎯 Lance recomendado: <strong>${fmtPctNum(k.rec)}</strong> = <strong>${fmt((k.base * k.rec) / 100)}</strong> <span class="muted small">(acima de 75% dos vencedores recentes)</span>`;
+  }
+  // poder de lance
+  const wins = k.sorted.filter(x => x <= k.power).length;
+  const powerOut = `Guardado ${fmt(k.saved)}${k.fgts ? ` + FGTS ${fmt(k.fgts)}` : ''} + embutido ${fmtPctNum(k.embMax)} (${fmt(k.embR)}) = <strong>${fmtPctNum(k.power)}</strong> ${k.g.bidBase === 'saldo' ? 'do saldo devedor' : 'da carta'}
+    ${k.sorted.length ? `<br>Com esse lance você teria vencido em <strong>${wins} de ${k.sorted.length}</strong> assembleias recentes (${pct(wins / k.sorted.length)}).` : ''}
+    <br><span class="muted small">Usando o embutido máximo, a carta liberada cai para ${fmt(s.creditNow - k.embR)}.</span>`;
+  // plano
+  let planOut = '<span class="muted">Informe o histórico de lances para calcular a meta.</span>';
+  if (k.rec) {
+    const targetOwn = (k.base * k.rec) / 100 - k.embR - k.fgts;
+    if (targetOwn <= k.saved) planOut = `✅ <strong>Você já consegue ofertar o lance recomendado</strong> (${fmtPctNum(k.rec)}). Oferte na próxima assembleia.`;
+    else if (k.saving > 0) {
+      const i = market.cdi ? Math.pow(1 + (market.cdi * 0.85) / 100, 1 / 12) - 1 : 0;
+      let acc = k.saved, m = 0; while (acc < targetOwn && m < 600) { acc = acc * (1 + i) + k.saving; m++; }
+      planOut = `Faltam <strong>${fmt(targetOwn - k.saved)}</strong> do seu bolso. Guardando ${fmt(k.saving)}/mês${i ? ' num CDB/Tesouro Selic' : ''}, você chega lá em <strong>${monthsText(m)}</strong> (${monthLabel(addMonths(currentMonth(), m))}).`;
+    } else planOut = `Faltam <strong>${fmt(targetOwn - k.saved)}</strong> do seu bolso. Informe quanto consegue guardar por mês para ver em quanto tempo chega lá.`;
+  }
+  // próxima assembleia
+  const day = +v('day', 0);
+  let nextAss = '';
+  if (day) { let ym = currentMonth(); if (+todayISO().slice(8) > Math.min(day, daysInMonth(ym))) ym = addMonths(ym, 1); nextAss = fmtDate(dueDate(ym, day)); }
+  const tips = [
+    nextAss && `📅 Próxima assembleia: <strong>${nextAss}</strong>. Registre o lance alguns dias antes, no app da administradora.`,
+    k.rec && `Oferte <strong>todo mês</strong> pelo menos ${fmtPctNum(Math.min(k.power, k.rec))}: se não vencer, nada é cobrado.`,
+    `Combine <strong>embutido + lance livre</strong> para chegar a um percentual competitivo sem tirar tudo do bolso, lembrando que o embutido reduz a carta.`,
+    `Se o grupo tiver <strong>lance fixo</strong>, participe também: é sorteado entre quem oferta o mesmo percentual.`,
+    g.imovel && `No consórcio de imóvel, o <strong>FGTS</strong> pode compor o lance (confirme as regras com a administradora).`,
+    `Guarde o dinheiro do lance em aplicação com liquidez diária (CDB 100% CDI / Tesouro Selic) para render até a contemplação.`,
+    `Atualize aqui o histórico de lances a cada assembleia: a recomendação acompanha a disputa do grupo.`,
+  ].filter(Boolean);
+
+  const results = `<div class="stack">
+    <div class="card"><h2>🎲 Chance por sorteio</h2><p>${sortOut}</p></div>
+    <div class="card"><h2>📊 Lances vencedores</h2><p>${histOut}</p></div>
+    <div class="card"><h2>💪 Seu poder de lance hoje</h2><p>${powerOut}</p></div>
+    <div class="card"><h2>🗓️ Plano para chegar lá</h2><p>${planOut}</p></div>
+  </div>`;
+  return head + `<div class="grid two">${form}${results}</div>
+    <div class="card mt"><h2>✅ O que fazer agora</h2><ul class="tips">${tips.map(t => `<li>${t}</li>`).join('')}</ul>
+    <p class="small muted">Estimativas baseadas nos dados informados. Regras de lance variam por administradora e grupo.</p></div>`;
 }
 
 function viewDebts() {
+  if (ui.cons) return viewConsStrategy();
   if (ui.sim) return viewSimulator();
   const head = `<div class="page-head"><div><h1>Financiamentos e consórcios</h1><p>Saldo devedor, parcelas, quitação, amortizações e lances</p></div>
     <div class="toolbar"><button class="btn" data-action="add-debt" data-kind="consorcio">+ Consórcio</button><button class="btn primary" data-action="add-debt" data-kind="financiamento">+ Financiamento</button></div></div>`;
@@ -1574,7 +1780,7 @@ function suggestTagWith(rules, desc, amount) { const old = state.rules; state.ru
 
 /* ================================================================ actions */
 const actions = {
-  nav: el => { if ($('#modal').open) $('#modal').close(); ui.sim = null; ui.view = el.dataset.view; render(); window.scrollTo(0, 0); },
+  nav: el => { if ($('#modal').open) $('#modal').close(); ui.sim = null; ui.cons = null; ui.view = el.dataset.view; render(); window.scrollTo(0, 0); },
   'toggle-hide': () => { prefs.hide = !prefs.hide; savePrefs(); render(); },
   'hide-onboarding': () => { prefs.hideOnboarding = true; savePrefs(); render(); },
   'onboarding-go': el => { if (el.dataset.go === 'budgets') return actions['edit-budgets'](); ui.view = el.dataset.go; render(); window.scrollTo(0, 0); },
@@ -1730,7 +1936,20 @@ const actions = {
   reset: () => { if (confirm('Apagar TODOS os dados? Exporte um backup antes.' + (Sync.enabled() ? '\n\nA sincronização está ativa: os dados também serão apagados na nuvem e nos outros aparelhos.' : ''))) { state = defaultState(); save(); render(); } },
   'modal-cancel': () => { ui.pendingSync = null; $('#modal').close(); },
   'clear-logo': () => {},
-  'open-sim': el => { const d = state.debts.find(x => x.id === el.dataset.id); ui.sim = { debtId: d.id, items: JSON.parse(JSON.stringify(d.plan || [])) }; ui.view = 'debts'; render(); window.scrollTo(0, 0); },
+  'open-sim': el => { const d = state.debts.find(x => x.id === el.dataset.id); ui.cons = null; ui.sim = { debtId: d.id, items: JSON.parse(JSON.stringify(d.plan || [])) }; ui.view = 'debts'; render(); window.scrollTo(0, 0); fetchMarket(); },
+  'open-cons': el => { ui.sim = null; ui.cons = el.dataset.id; ui.view = 'debts'; render(); window.scrollTo(0, 0); fetchMarket(); },
+  'close-cons': () => { ui.cons = null; render(); window.scrollTo(0, 0); },
+  'market-refresh': () => { fetchMarket(true).then(() => toast(market.cdi ? `CDI atualizado: ${fmtPctNum(market.cdi)} a.a.` : 'Não consegui buscar o CDI agora; informe manualmente.')); },
+  'fs-add': el => {
+    const d = state.debts.find(x => x.id === ui.sim.debtId); const st = financingStatus(d);
+    ui.sim.items.push({ value: +el.dataset.value, every: +el.dataset.every || 0, start: el.dataset.start || (st.next ? st.next.ym : currentMonth()), end: '', mode: 'prazo' });
+    render(); toast('Adicionado ao plano — veja o resultado no topo. Lembre de salvar.');
+  },
+  'fs-use': el => {
+    const d = state.debts.find(x => x.id === ui.sim.debtId); const st = financingStatus(d);
+    const sc = strategyScenarios(d, st.next.ym).list.find(x => x.key === el.dataset.scn);
+    if (sc) { ui.sim.items = JSON.parse(JSON.stringify(sc.items)); render(); window.scrollTo(0, 0); toast('Estratégia aplicada ao plano. Lembre de salvar.'); }
+  },
   'close-sim': () => { ui.sim = null; render(); window.scrollTo(0, 0); },
   'sim-preset': el => { $('#sp-value').value = el.dataset.value; $('#sp-every').value = el.dataset.every; $('#sp-start').value = el.dataset.start; $('#sp-end').value = ''; $('#sp-value').focus(); $('#sp-value').select(); },
   'sim-add': () => {
@@ -1922,6 +2141,11 @@ document.addEventListener('change', e => {
   const k = el.dataset.change; if (!k) return;
   if (k === 'tx-tag') { const t = state.transactions.find(x => x.id === el.dataset.id); t.tag = el.value; save(); if (ui.view === 'transactions') render(); }
   else if (k === 'sim-fin-mode') { const id = el.dataset.id; SIM[id] = { ...SIM[id], mode: el.value }; $('#sim-' + id).innerHTML = simText(state.debts.find(d => d.id === id)); }
+  else if (k === 'fs' || k === 'cs') {
+    const d = state.debts.find(x => x.id === el.dataset.id);
+    d.strategy = { ...(d.strategy || {}), [el.dataset.field]: el.type === 'checkbox' ? el.checked : el.value };
+    save(); render();
+  }
   else if (k === 'filter-month') { ui.filters.month = el.value; render(); }
   else if (k === 'filter-tag') { ui.filters.tag = el.value; render(); }
   else if (k === 'filter-account') { ui.filters.account = el.value; render(); }
