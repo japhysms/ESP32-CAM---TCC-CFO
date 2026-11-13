@@ -45,7 +45,17 @@ const DEFAULT_TAGS = [
 // Grupos da regra 50/30/20 (equilíbrio financeiro)
 const GROUPS = { essencial: 'Essencial', livre: 'Não essencial', investimento: 'Investimento' };
 const ACC_TYPES = { corrente: 'Conta corrente / poupança', cartao: 'Cartão de crédito', corretora: 'Corretora' };
-const NO_TAG = { name: 'Sem Tags', color: '#cbd5e1' };
+const NO_TAG = { name: 'Sem Tags', color: '#94a3b8', icon: '🏷️' };
+const DEFAULT_ICONS = {
+  'Salário': '💼', 'Outras receitas': '💰', 'Investimentos': '📈', 'Moradia': '🏠', 'Alimentação': '🍽️', 'Transporte': '🚗',
+  'Lazer': '🎉', 'Saúde': '🩺', 'Educação': '🎓', 'Assinaturas': '📺', 'Compras': '🛍️', 'Impostos e taxas': '🧾',
+  'Outros': '📦', 'Transferência': '🔁',
+};
+DEFAULT_TAGS.forEach(t => { t.icon = DEFAULT_ICONS[t.name] || '🏷️'; });
+const ICON_CHOICES = ['🍽️', '🛒', '🍔', '☕', '🍺', '🏠', '💡', '💧', '📶', '🚗', '⛽', '🚌', '🚕', '✈️', '🩺', '💊', '🏋️', '🎓', '📚',
+  '🎉', '🎬', '🎮', '🎵', '📺', '🛍️', '👕', '💄', '🎁', '🐾', '👶', '💇', '🔧', '🧹', '❤️', '⛪', '🧾', '🏦', '💳', '💼', '💰', '📈', '🪙', '🔁', '📦', '🏷️'];
+function iconBadge(icon, color, cls = '') { return `<span class="ticon ${cls}" style="--c:${color}">${esc(icon || '🏷️')}</span>`; }
+function tagIcon(name, cls = '') { const t = tagInfo(name); return iconBadge(t.icon, t.color, cls); }
 
 // [padrões separados por |, tag, sinal: any | in | out]
 const DEFAULT_RULES = [
@@ -75,6 +85,8 @@ const ASSET_CLASSES = {
   'Exterior': { color: '#ec4899' },
   'Outros': { color: '#a3a3a3' },
 };
+Object.entries({ 'Ações': '📊', 'FIIs': '🏢', 'ETFs': '🧺', 'BDRs': '🌎', 'Renda Fixa': '🏦', 'Tesouro Direto': '🏛️', 'Cripto': '🪙', 'Exterior': '🌐', 'Outros': '📦' })
+  .forEach(([k, v]) => { ASSET_CLASSES[k].icon = v; });
 const COINGECKO_IDS = { BTC: 'bitcoin', ETH: 'ethereum', SOL: 'solana', USDT: 'tether', USDC: 'usd-coin', ADA: 'cardano', XRP: 'ripple', BNB: 'binancecoin', DOGE: 'dogecoin', DOT: 'polkadot', LINK: 'chainlink', MATIC: 'matic-network', AVAX: 'avalanche-2' };
 
 function inferClass(ticker) {
@@ -106,7 +118,11 @@ function defaultState() {
 function normalizeState(s) {
   const d = defaultState();
   const merged = { ...d, ...s, settings: { ...d.settings, ...s.settings }, investments: { ...d.investments, ...s.investments }, budgets: s.budgets || {}, meta: s.meta || {} };
-  for (const t of merged.tags) if (t.group === undefined) t.group = DEFAULT_TAGS.find(x => x.name === t.name)?.group || '';
+  for (const t of merged.tags) {
+    const def = DEFAULT_TAGS.find(x => x.name === t.name);
+    if (t.group === undefined) t.group = def?.group || '';
+    if (t.icon === undefined) t.icon = def?.icon || '🏷️';
+  }
   return merged;
 }
 function loadState() {
@@ -158,7 +174,57 @@ function accountBalance(a, end = todayISO()) {
 }
 const accountColor = a => a.color || { corrente: '#7c3aed', cartao: '#e11d48', corretora: '#2563eb' }[a.type] || '#64748b';
 const initials = name => String(name).split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0]).join('').toUpperCase();
-const avatar = a => `<span class="avatar" style="background:${accountColor(a)}">${esc(initials(a.name))}</span>`;
+// Selos dos bancos: cor e sigla de cada instituição (não usa os logotipos oficiais; o usuário pode enviar uma imagem própria)
+const BANKS = [
+  ['nubank', 'Nubank', /\bnu(bank|conta)?\b/i, '#820ad1', '#fff', 'nu'],
+  ['itau', 'Itaú', /ita[uú]/i, '#ec7000', '#fff', 'itaú'],
+  ['bb', 'Banco do Brasil', /banco do brasil|\bbb\b/i, '#fcfc30', '#0038a8', 'BB'],
+  ['bradesco', 'Bradesco', /bradesco/i, '#cc092f', '#fff', 'brad'],
+  ['santander', 'Santander', /santander/i, '#ec0000', '#fff', 'sant'],
+  ['caixa', 'Caixa', /caixa|\bcef\b/i, '#005ca9', '#f39200', 'CX'],
+  ['inter', 'Inter', /\binter\b/i, '#ff7a00', '#fff', 'inter'],
+  ['c6', 'C6 Bank', /\bc6\b/i, '#242424', '#fff', 'C6'],
+  ['next', 'Next', /\bnext\b/i, '#00e45a', '#0b0b0b', 'next'],
+  ['picpay', 'PicPay', /picpay/i, '#21c25e', '#fff', 'pic'],
+  ['mercadopago', 'Mercado Pago', /mercado ?pago/i, '#00b1ea', '#fff', 'MP'],
+  ['pagbank', 'PagBank', /pag ?(bank|seguro)/i, '#1bb99a', '#fff', 'pag'],
+  ['neon', 'Neon', /\bneon\b/i, '#00e5ff', '#0b1f3a', 'neon'],
+  ['will', 'Will Bank', /will ?bank/i, '#ffd900', '#111', 'will'],
+  ['original', 'Banco Original', /original/i, '#00a857', '#fff', 'orig'],
+  ['sicoob', 'Sicoob', /sicoob/i, '#003641', '#7db61c', 'scb'],
+  ['sicredi', 'Sicredi', /sicredi/i, '#3fa110', '#fff', 'scr'],
+  ['safra', 'Safra', /safra/i, '#002d5a', '#c9a14a', 'safra'],
+  ['xp', 'XP Investimentos', /\bxp\b/i, '#111111', '#fff', 'XP'],
+  ['btg', 'BTG Pactual', /btg/i, '#0d2c54', '#fff', 'btg'],
+  ['rico', 'Rico', /\brico\b/i, '#ff5a00', '#fff', 'rico'],
+  ['clear', 'Clear', /\bclear\b/i, '#00a3e0', '#fff', 'clr'],
+  ['avenue', 'Avenue', /avenue/i, '#0a2240', '#fff', 'av'],
+  ['binance', 'Binance', /binance/i, '#f3ba2f', '#111', 'bnb'],
+].map(([id, name, match, bg, fg, label]) => ({ id, name, match, bg, fg, label }));
+function bankOf(a) {
+  if (a.bank === 'none') return null;
+  if (a.bank) return BANKS.find(b => b.id === a.bank) || null;
+  return BANKS.find(b => b.match.test(a.name || '')) || null;
+}
+function avatar(a, cls = '') {
+  if (a.logo && /^data:image\//.test(a.logo)) return `<img class="avatar ${cls}" src="${esc(a.logo)}" alt="">`;
+  const b = bankOf(a);
+  if (b) return `<span class="avatar bank ${cls}" title="${esc(b.name)}" style="background:${b.bg};color:${b.fg};font-size:${b.label.length <= 2 ? 13 : b.label.length <= 4 ? 11 : 9}px">${esc(b.label)}</span>`;
+  return `<span class="avatar ${cls}" style="background:${accountColor(a)}">${esc(initials(a.name))}</span>`;
+}
+function resizeImage(file, size = 96) {
+  return new Promise((res, rej) => {
+    const img = new Image(); const url = URL.createObjectURL(file);
+    img.onload = () => {
+      const c = document.createElement('canvas'); c.width = c.height = size;
+      const m = Math.min(img.width, img.height);
+      c.getContext('2d').drawImage(img, (img.width - m) / 2, (img.height - m) / 2, m, m, 0, 0, size, size);
+      URL.revokeObjectURL(url); res(c.toDataURL('image/png'));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); rej(new Error('Não consegui ler essa imagem.')); };
+    img.src = url;
+  });
+}
 
 function spentByTag(ym, tag) {
   return -sum(monthTx(ym).filter(t => !isExcluded(t) && t.amount < 0 && (t.tag || '') === tag), t => t.amount);
@@ -191,7 +257,7 @@ function byTag(ym, mode) {
   const txs = monthTx(ym).filter(t => !isExcluded(t) && (mode === 'out' ? t.amount < 0 : t.amount > 0));
   const map = new Map();
   for (const t of txs) map.set(t.tag || '', (map.get(t.tag || '') || 0) + Math.abs(t.amount));
-  const items = [...map].map(([tag, value]) => ({ tag, label: tagInfo(tag).name, color: tagInfo(tag).color, value }));
+  const items = [...map].map(([tag, value]) => ({ tag, label: tagInfo(tag).name, color: tagInfo(tag).color, icon: tagInfo(tag).icon, value }));
   items.sort((a, b) => b.value - a.value);
   return { items, total: sum(items, i => i.value) };
 }
@@ -320,7 +386,7 @@ function legendHTML(items, total, action) {
   if (!items.length) return '<p class="muted">Sem dados no período.</p>';
   return `<ul class="legend">${items.map(i => `
     <li ${action ? `data-action="${action}" data-tag="${esc(i.tag)}"` : ''}>
-      <span class="dot" style="background:${i.color}"></span>
+      ${i.icon ? iconBadge(i.icon, i.color, 'sm') : `<span class="dot" style="background:${i.color}"></span>`}
       <span>${esc(i.label)}</span>
       <span class="val">${fmt(i.value)}</span>
       <span class="p">${pct(total ? i.value / total : 0)}</span>
@@ -454,7 +520,7 @@ function viewOverview() {
     <div class="big-number">${fmt(pf.value)}</div>
     <div class="small ${pf.result >= 0 ? 'pos' : 'neg'}">${pf.result >= 0 ? '▲' : '▼'} ${fmt(pf.result)} (${pct(pf.resultPct)}) sobre ${fmt(pf.cost)} aplicados</div>
     <h2 class="mt">Maiores gastos do mês</h2>
-    ${top.length ? top.map(t => `<div class="list-row"><span class="dot" style="background:${tagInfo(t.tag).color}"></span><span class="grow">${esc(t.description)}<br><span class="muted small">${fmtDate(t.date)} · ${esc(tagInfo(t.tag).name)}</span></span><span class="neg">${fmt(t.amount)}</span></div>`).join('') : '<p class="muted">Nenhum gasto no mês.</p>'}
+    ${top.length ? top.map(t => `<div class="list-row">${tagIcon(t.tag)}<span class="grow">${esc(t.description)}<br><span class="muted small">${fmtDate(t.date)} · ${esc(tagInfo(t.tag).name)}</span></span><span class="neg">${fmt(t.amount)}</span></div>`).join('') : '<p class="muted">Nenhum gasto no mês.</p>'}
   </div>`;
 
   return head + kpis + `<div class="grid two">${heat}${tags}</div>
@@ -525,7 +591,7 @@ function goalsCard() {
   return `<div class="card">${head}${entries.map(({ tag, lim, spent }) => {
     const r = spent / lim;
     const color = r > 1 ? 'var(--red)' : r > 0.8 ? 'var(--amber)' : 'var(--green)';
-    return `<div class="goal"><div class="goal-top"><span><span class="dot" style="background:${tagInfo(tag).color}"></span> ${esc(tag)}</span>
+    return `<div class="goal"><div class="goal-top"><span class="goal-name">${tagIcon(tag, 'sm')} ${esc(tag)}</span>
       <span class="small">${fmt(spent)} <span class="muted">de ${fmt(lim)}</span></span></div>
       <div class="bar"><span style="width:${Math.min(100, r * 100)}%;background:${color}"></span></div>
       <div class="small ${r > 1 ? 'neg' : 'muted'}">${r > 1 ? `estourou em ${fmt(spent - lim)}` : `restam ${fmt(lim - spent)}`}</div></div>`;
@@ -596,8 +662,8 @@ function viewTransactions() {
     <tr class="${isExcluded(t) ? 'muted' : ''}">
       <td>${fmtDate(t.date)}</td>
       <td class="desc">${esc(t.description)}${t.source && t.source !== 'manual' ? ` <span class="muted small">· ${esc(t.source)}</span>` : ''}</td>
-      <td class="muted">${esc(account(t.accountId)?.name || '—')}</td>
-      <td><select class="tag-select" data-change="tx-tag" data-id="${t.id}">${tagOptions(t.tag || '')}</select></td>
+      <td class="muted"><div class="acc-cell">${account(t.accountId) ? avatar(account(t.accountId), 'xs') : ''}${esc(account(t.accountId)?.name || '—')}</div></td>
+      <td><div class="tag-cell">${tagIcon(t.tag || '', 'sm')}<select class="tag-select" data-change="tx-tag" data-id="${t.id}">${tagOptions(t.tag || '')}</select></div></td>
       <td class="num ${t.amount >= 0 ? 'pos' : 'neg'}">${fmt(t.amount)}</td>
       <td><div class="row-actions">
         <button class="icon-btn" title="Criar regra a partir desta transação" data-action="rule-from-tx" data-id="${t.id}">⚡</button>
@@ -643,7 +709,7 @@ function viewInvestments() {
 
   const byClass = {};
   for (const p of active) byClass[p.asset.class] = (byClass[p.asset.class] || 0) + p.value;
-  const clsItems = Object.entries(byClass).map(([c, v]) => ({ tag: c, label: c, value: v, color: ASSET_CLASSES[c]?.color || '#a3a3a3' })).sort((a, b) => b.value - a.value);
+  const clsItems = Object.entries(byClass).map(([c, v]) => ({ tag: c, label: c, value: v, color: ASSET_CLASSES[c]?.color || '#a3a3a3', icon: ASSET_CLASSES[c]?.icon })).sort((a, b) => b.value - a.value);
   const alloc = `<div class="card"><h2>Alocação por classe</h2><div class="sub">distribuição do patrimônio</div>
     <div class="donut-wrap">${donutSVG(clsItems, totals.value, fmt(totals.value), 'patrimônio')}${legendHTML(clsItems, totals.value)}</div></div>`;
 
@@ -660,7 +726,7 @@ function viewInvestments() {
     const upd = a.priceUpdatedAt ? `atualizado ${new Date(a.priceUpdatedAt).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' })}` : 'preço manual';
     return `<tr>
       <td><strong>${esc(a.ticker)}</strong></td>
-      <td><span class="pill"><span class="dot" style="background:${ASSET_CLASSES[a.class]?.color}"></span>${esc(a.class)}</span></td>
+      <td><span class="pill">${ASSET_CLASSES[a.class]?.icon || ''} ${esc(a.class)}</span></td>
       <td class="num">${manual ? '—' : fmtNum(p.qty)}</td>
       <td class="num">${manual ? '—' : fmt(p.avg)}</td>
       <td class="num" title="${esc(upd)}">${manual ? '—' : fmt(p.price)}</td>
@@ -803,7 +869,7 @@ function viewSettings() {
         <span class="${r.amount >= 0 ? 'pos' : 'neg'}">${fmt(r.amount)}</span><button class="icon-btn" data-action="edit-rec" data-id="${r.id}">✎</button><button class="icon-btn" data-action="del-rec" data-id="${r.id}">✕</button></div>`).join('') : '<p class="muted">Nenhum lançamento recorrente.</p>'}
     </div>
     <div class="card"><div class="card-head"><h2>Tags</h2><button class="btn small" data-action="add-tag">+ Tag</button></div>
-      ${state.tags.map(t => `<div class="list-row"><span class="dot" style="background:${t.color}"></span><span class="grow">${esc(t.name)}${t.exclude ? ' <span class="muted small">(fora de receitas/despesas)</span>' : ''}${t.group ? ` <span class="muted small">· ${GROUPS[t.group]}</span>` : ''}</span>
+      ${state.tags.map(t => `<div class="list-row">${iconBadge(t.icon, t.color)}<span class="grow">${esc(t.name)}${t.exclude ? ' <span class="muted small">(fora de receitas/despesas)</span>' : ''}${t.group ? ` <span class="muted small">· ${GROUPS[t.group]}</span>` : ''}</span>
         <button class="icon-btn" data-action="edit-tag" data-name="${esc(t.name)}">✎</button><button class="icon-btn" data-action="del-tag" data-name="${esc(t.name)}">✕</button></div>`).join('')}
     </div>
     <div class="card"><h2>Backup</h2><div class="sub">Os dados ficam só neste navegador. Exporte com frequência.</div>
@@ -997,9 +1063,9 @@ function loadDemo() {
   s.settings.name = state.settings.name;
   s.settings.brapiToken = state.settings.brapiToken;
   s.accounts = [
-    { id: 'conta', name: 'Conta corrente', type: 'corrente', initialBalance: 8500, color: '#7c3aed' },
-    { id: 'poupanca', name: 'Poupança', type: 'corrente', initialBalance: 6000, color: '#0ea5e9' },
-    { id: 'cartao', name: 'Cartão de crédito', type: 'cartao', initialBalance: -2600, limit: 9000, color: '#e11d48' },
+    { id: 'conta', name: 'Nubank', type: 'corrente', initialBalance: 8500, color: '#7c3aed' },
+    { id: 'poupanca', name: 'Banco do Brasil', type: 'corrente', initialBalance: 6000, color: '#0ea5e9' },
+    { id: 'cartao', name: 'Itaú Visa', type: 'cartao', initialBalance: -2600, limit: 9000, color: '#e11d48' },
   ];
   s.budgets = { 'Alimentação': 1600, 'Transporte': 600, 'Lazer': 350, 'Compras': 300, 'Assinaturas': 100 };
   const tx = (date, description, amount, accountId = 'conta') => s.transactions.push({ id: uid(), date, description, amount: round2(amount), tag: '', accountId, source: 'exemplo' });
@@ -1142,8 +1208,8 @@ const actions = {
   'del-rule': el => { state.rules = state.rules.filter(r => r.id !== el.dataset.id); save(); render(); },
   'rule-up': el => { const i = +el.dataset.idx; if (i > 0) { [state.rules[i - 1], state.rules[i]] = [state.rules[i], state.rules[i - 1]]; save(); render(); } },
 
-  'add-account': () => openModal('Nova conta', accountForm(), d => { state.accounts.push({ id: uid(), name: d.name, type: d.type, initialBalance: +d.initialBalance || 0, limit: +d.limit || 0, color: d.color }); }),
-  'edit-account': el => { const a = account(el.dataset.id); openModal('Editar conta', accountForm(a), d => { Object.assign(a, { name: d.name, type: d.type, initialBalance: +d.initialBalance || 0, limit: +d.limit || 0, color: d.color }); }); },
+  'add-account': () => openModal('Nova conta', accountForm(), d => { state.accounts.push({ id: uid(), name: d.name, type: d.type, initialBalance: +d.initialBalance || 0, limit: +d.limit || 0, color: d.color, bank: d.bank, logo: d.logo || '' }); }, { onOpen: wireAccountForm }),
+  'edit-account': el => { const a = account(el.dataset.id); openModal('Editar conta', accountForm(a), d => { Object.assign(a, { name: d.name, type: d.type, initialBalance: +d.initialBalance || 0, limit: +d.limit || 0, color: d.color, bank: d.bank, logo: d.logo || '' }); }, { onOpen: wireAccountForm }); },
   'del-account': el => {
     if (state.accounts.length === 1) return toast('Mantenha pelo menos uma conta.');
     const n = state.transactions.filter(t => t.accountId === el.dataset.id).length;
@@ -1153,11 +1219,11 @@ const actions = {
     save(); render();
   },
 
-  'add-tag': () => openModal('Nova tag', tagForm(), d => { if (state.tags.some(t => t.name === d.name.trim())) { toast('Já existe.'); return false; } state.tags.push({ name: d.name.trim(), color: d.color, group: d.group, exclude: d.exclude }); }),
+  'add-tag': () => openModal('Nova tag', tagForm(), d => { if (state.tags.some(t => t.name === d.name.trim())) { toast('Já existe.'); return false; } state.tags.push({ name: d.name.trim(), color: d.color, icon: d.icon.trim() || '🏷️', group: d.group, exclude: d.exclude }); }),
   'edit-tag': el => {
     const t = state.tags.find(x => x.name === el.dataset.name); const old = t.name;
     openModal('Editar tag', tagForm(t), d => {
-      const name = d.name.trim(); Object.assign(t, { name, color: d.color, group: d.group, exclude: d.exclude });
+      const name = d.name.trim(); Object.assign(t, { name, color: d.color, icon: d.icon.trim() || '🏷️', group: d.group, exclude: d.exclude });
       if (name !== old && state.budgets?.[old] !== undefined) { state.budgets[name] = state.budgets[old]; delete state.budgets[old]; }
       if (name !== old) { state.transactions.forEach(x => { if (x.tag === old) x.tag = name; }); state.rules.forEach(x => { if (x.tag === old) x.tag = name; }); state.recurring.forEach(x => { if (x.tag === old) x.tag = name; }); }
     });
@@ -1219,6 +1285,11 @@ const actions = {
   },
   reset: () => { if (confirm('Apagar TODOS os dados? Exporte um backup antes.' + (Sync.enabled() ? '\n\nA sincronização está ativa: os dados também serão apagados na nuvem e nos outros aparelhos.' : ''))) { state = defaultState(); save(); render(); } },
   'modal-cancel': () => { ui.pendingSync = null; $('#modal').close(); },
+  'clear-logo': () => {},
+  'pick-icon': el => {
+    const f = el.closest('form'); f.icon.value = el.dataset.icon;
+    f.querySelectorAll('.icon-grid .sel').forEach(b => b.classList.remove('sel')); el.classList.add('sel');
+  },
 
   'sync-connect': async el => {
     const token = $('#sync-token').value.trim(), password = $('#sync-pass').value;
@@ -1270,6 +1341,17 @@ const actions = {
   'clear-conflict': () => { Sync.clearConflictBackup(); render(); },
 };
 
+function wireAccountForm(dlg) {
+  const f = dlg.querySelector('form');
+  const preview = () => { $('#acc-preview').innerHTML = avatar({ name: f.name.value, bank: f.bank.value, color: f.color.value, type: f.type.value, logo: f.logo.value }); };
+  f.addEventListener('input', preview);
+  f.addEventListener('change', async e => {
+    if (e.target.name !== 'logoFile') return preview();
+    const file = e.target.files[0]; if (!file) return;
+    try { f.logo.value = await resizeImage(file); preview(); } catch (err) { toast(err.message); }
+  });
+  f.addEventListener('click', e => { if (e.target.closest('[data-action=clear-logo]')) { f.logo.value = ''; preview(); } });
+}
 function accountForm(a = {}) {
   return `<div class="form-grid">
     <label class="full">Nome<input type="text" name="name" required value="${esc(a.name || '')}" placeholder="Nubank, Itaú, Cartão Inter…"></label>
@@ -1279,13 +1361,27 @@ function accountForm(a = {}) {
       <option value="corretora" ${a.type === 'corretora' ? 'selected' : ''}>Corretora</option></select></label>
     <label>Saldo inicial (R$)<input type="number" step="0.01" name="initialBalance" value="${a.initialBalance ?? 0}"></label>
     <label>Limite do cartão (R$)<input type="number" step="0.01" name="limit" value="${a.limit || ''}" placeholder="só para cartões"></label>
-    <label>Cor<input type="color" name="color" value="${a.color || accountColor(a)}" style="height:38px"></label>
+    <label>Banco (ícone)<select name="bank">
+      <option value="" ${!a.bank ? 'selected' : ''}>Automático pelo nome</option>
+      ${BANKS.map(b => `<option value="${b.id}" ${a.bank === b.id ? 'selected' : ''}>${esc(b.name)}</option>`).join('')}
+      <option value="none" ${a.bank === 'none' ? 'selected' : ''}>Nenhum (iniciais + cor)</option></select></label>
+    <label>Cor (sem banco)<input type="color" name="color" value="${a.color || accountColor(a)}" style="height:38px"></label>
+    <div class="field full">Imagem própria (opcional)
+      <div class="acc-preview"><span id="acc-preview">${avatar(a)}</span>
+        <input type="file" name="logoFile" accept="image/*">
+        <button type="button" class="btn small ghost" data-action="clear-logo">Remover imagem</button></div>
+      <input type="hidden" name="logo" value="${esc(a.logo || '')}">
+    </div>
   </div><p class="muted small">"Saldo em conta" soma apenas contas corrente/poupança: saldo inicial + transações até o fim do mês.</p>`;
 }
 function tagForm(t = {}) {
   return `<div class="form-grid">
     <label>Nome<input type="text" name="name" required value="${esc(t.name || '')}"></label>
     <label>Cor<input type="color" name="color" value="${t.color || '#2563eb'}" style="height:38px"></label>
+    <div class="field full">Ícone
+      <input type="text" name="icon" value="${esc(t.icon || '🏷️')}" maxlength="8" class="icon-input">
+      <div class="icon-grid">${ICON_CHOICES.map(i => `<button type="button" data-action="pick-icon" data-icon="${i}" class="${i === t.icon ? 'sel' : ''}">${i}</button>`).join('')}</div>
+    </div>
     <label class="full">Grupo (equilíbrio 50/30/20)<select name="group">${[['', 'Nenhum (receitas, transferências)'], ['essencial', 'Essencial — até 50% da receita'], ['livre', 'Não essencial — até 30%'], ['investimento', 'Investimento — mínimo 20%']].map(([v, l]) => `<option value="${v}" ${(t.group || '') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
     <label class="check full"><input type="checkbox" name="exclude" ${t.exclude ? 'checked' : ''}> Não contar como receita/despesa (ex.: transferências entre contas, pagamento de fatura)</label>
   </div>`;
