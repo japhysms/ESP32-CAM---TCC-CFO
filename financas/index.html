@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Minhas Finanças</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">💰 Minhas Finanças</div>
+    <nav class="tabs" id="tabs">
+      <button data-action="nav" data-view="overview" class="active">Visão geral</button>
+      <button data-action="nav" data-view="transactions">Transações</button>
+      <button data-action="nav" data-view="investments">Investimentos</button>
+      <button data-action="nav" data-view="import">Importar</button>
+      <button data-action="nav" data-view="settings">Configurações</button>
+    </nav>
+  </header>
+
+  <main id="app"></main>
+
+  <dialog id="modal">
+    <form method="dialog" id="modal-form">
+      <h3 class="modal-title"></h3>
+      <div class="modal-body"></div>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" data-action="modal-cancel">Cancelar</button>
+        <button type="submit" class="btn primary">Salvar</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="importers.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

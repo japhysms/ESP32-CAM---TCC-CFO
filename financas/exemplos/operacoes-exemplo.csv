@@ -1,0 +1,6 @@
+data;ticker;tipo;quantidade;preco;taxas
+02/01/2026;PETR4;compra;100;34,10;0
+15/02/2026;MXRF11;compra;500;10,05;0
+10/03/2026;BTC;compra;0,01;380000;0
+15/03/2026;MXRF11;provento;1;45,00;0
+20/05/2026;PETR4;venda;30;39,90;0
