@@ -111,13 +111,14 @@ function defaultState() {
     rules: DEFAULT_RULES.map(r => ({ id: uid(), ...r })),
     recurring: [],
     budgets: {},
+    debts: [],
     transactions: [],
     investments: { assets: [], operations: [], history: {} },
   };
 }
 function normalizeState(s) {
   const d = defaultState();
-  const merged = { ...d, ...s, settings: { ...d.settings, ...s.settings }, investments: { ...d.investments, ...s.investments }, budgets: s.budgets || {}, meta: s.meta || {} };
+  const merged = { ...d, ...s, settings: { ...d.settings, ...s.settings }, investments: { ...d.investments, ...s.investments }, budgets: s.budgets || {}, debts: s.debts || [], meta: s.meta || {} };
   for (const t of merged.tags) {
     const def = DEFAULT_TAGS.find(x => x.name === t.name);
     if (t.group === undefined) t.group = def?.group || '';
@@ -270,7 +271,9 @@ function runRecurring() {
       if (r.generated.includes(m)) continue;
       const date = `${m}-${pad(Math.min(+r.day || 1, daysInMonth(m)))}`;
       if (date > today) continue;
-      state.transactions.push({ id: uid(), date, description: r.description, amount: +r.amount, tag: r.tag, accountId: r.accountId, source: 'recorrente', externalId: `rec:${r.id}:${m}` });
+      const amount = r.debtId ? -debtPaymentFor(r.debtId, m) : +r.amount;
+      if (r.debtId && !amount) { r.generated.push(m); continue; }
+      state.transactions.push({ id: uid(), date, description: r.description, amount, tag: r.tag, accountId: r.accountId, source: 'recorrente', externalId: `rec:${r.id}:${m}` });
       r.generated.push(m); added++;
     }
   }
@@ -578,6 +581,7 @@ function accountsCard() {
     <div class="big-number">${fmt(total)}</div>
     ${banks.map(a => `<div class="list-row clickable" data-action="goto-account" data-id="${a.id}">${avatar(a)}<span class="grow"><strong>${esc(a.name)}</strong><br><span class="muted small">${ACC_TYPES[a.type]}</span></span><span class="acc-val">${fmt(accountBalance(a))}</span></div>`).join('')}
     ${cards.length ? `<h2 class="mt">Cartões de crédito</h2>${cards.map(cardHTML).join('')}` : `<p class="muted small mt">Cadastre seus cartões em Configurações para acompanhar limite e fatura.</p>`}
+    ${debtsMini()}
   </div>`;
 }
 
@@ -755,6 +759,440 @@ function viewInvestments() {
   return head + kpis + `<div class="grid two">${alloc}${evo}</div>` + table + opsTable;
 }
 
+/* ===================================================== financiamentos e consórcios */
+const SIM = {}; // estado dos simuladores (só na tela, não é salvo)
+function isPaidMonth(ym, day) {
+  const cur = currentMonth();
+  if (ym < cur) return true;
+  if (ym > cur) return false;
+  return +todayISO().slice(8) >= Math.min(day, daysInMonth(ym));
+}
+const pmt = (pv, i, n) => (i ? (pv * i) / (1 - Math.pow(1 + i, -n)) : pv / n);
+const dueDate = (ym, day) => `${ym}-${pad(Math.min(day, daysInMonth(ym)))}`;
+const fmtRate = v => String(+v || 0).replace('.', ',') + '%';
+function monthsText(k) {
+  const y = Math.floor(k / 12), m = k % 12;
+  return [y ? `${y} ano${y > 1 ? 's' : ''}` : '', m ? `${m} ${m > 1 ? 'meses' : 'mês'}` : ''].filter(Boolean).join(' e ') || '0 meses';
+}
+
+/** Tabela de amortização (SAC ou Price), com amortizações extras e ajuste pelo saldo informado pelo banco. */
+function financingSchedule(d, more = []) {
+  const i = Math.pow(1 + (+d.rate || 0) / 100, 1 / 12) - 1;
+  const n = +d.term, fees = +d.fees || 0, start = d.firstDue.slice(0, 7), price = d.system === 'PRICE';
+  const extras = [...(d.extras || []), ...more].map(e => ({ ...e, ym: e.date.slice(0, 7) })).sort((a, b) => a.ym.localeCompare(b.ym));
+  let saldo = +d.principal, inst = price ? pmt(saldo, i, n) : saldo / n, ei = 0, nEff = n;
+  const rows = []; const applied = {}; rows.applied = applied;
+  const has = v => v !== undefined && v !== null && v !== '';
+  const recalc = m => { const left = Math.max(1, nEff - m); inst = price ? pmt(saldo, i, left) : saldo / left; };
+  // Aplica o que o banco informou: saldo devedor, parcela e/ou parcelas restantes.
+  const applyBank = (bk, m, recalcIfOnlyBalance) => {
+    if (has(bk.balance)) saldo = +bk.balance;
+    if (+bk.remaining > 0) nEff = m + +bk.remaining;
+    if (+bk.installment > 0) inst = price ? +bk.installment - fees : Math.max(0, +bk.installment - fees - saldo * i);
+    else if (+bk.remaining > 0 || recalcIfOnlyBalance) recalc(m);
+  };
+  for (let m = 0; m < n + 600 && saldo > 0.005; m++) {
+    const ym = addMonths(start, m);
+    if (d.anchor && d.anchor.ym === ym) applyBank(d.anchor, m, true);
+    while (ei < extras.length && extras[ei].ym <= ym) {
+      const e = extras[ei++];
+      const v = Math.min(saldo, +e.value || 0);
+      saldo -= v; if (v > 0) applied[ym] = (applied[ym] || 0) + v;
+      if (e.mode === 'parcela') recalc(m);
+      if (has(e.bankBalance) || +e.bankInstallment > 0 || +e.bankRemaining > 0) applyBank({ balance: e.bankBalance, installment: e.bankInstallment, remaining: e.bankRemaining }, m, e.mode === 'parcela');
+    }
+    if (saldo <= 0.005) break;
+    const juros = saldo * i;
+    const amort = Math.min(price ? inst - juros : inst, saldo);
+    saldo -= amort;
+    rows.push({ ym, n: m + 1, juros, amort, fees, total: amort + juros + fees, saldo });
+  }
+  return rows;
+}
+function financingStatus(d, rows = financingSchedule(d)) {
+  const day = +d.firstDue.slice(8, 10);
+  const paid = rows.filter(r => isPaidMonth(r.ym, day)).length;
+  const unpaid = rows.slice(paid);
+  const saldo = unpaid.length ? unpaid[0].saldo + unpaid[0].amort : 0;
+  return {
+    rows, day, paid, total: rows.length, saldo, next: unpaid[0],
+    remainingInterest: sum(unpaid, r => r.juros), remainingTotal: sum(unpaid, r => r.total),
+    paidTotal: sum(rows.slice(0, paid), r => r.total), endYm: rows.length ? rows[rows.length - 1].ym : null,
+    pct: +d.principal ? Math.max(0, 1 - saldo / +d.principal) : 1,
+  };
+}
+function realizedSavings(d) {
+  if (!(d.extras || []).length) return null;
+  const pure = financingSchedule({ ...d, extras: [], anchor: null });
+  const real = financingSchedule({ ...d, anchor: null });
+  return { interest: sum(pure, r => r.juros) - sum(real, r => r.juros), months: pure.length - real.length, total: sum(d.extras, e => +e.value || 0) };
+}
+function extraForm(e = {}) {
+  const v = k => (e[k] === undefined || e[k] === null ? '' : e[k]);
+  return `<div class="form-grid">
+    <label>Data em que pagou<input type="date" name="date" required value="${e.date || todayISO()}"></label>
+    <label>Valor amortizado (R$)<input type="number" step="0.01" min="0" name="value" required value="${v('value')}"></label>
+    <label class="full">O banco aplicou para<select name="mode"><option value="prazo">Reduzir o prazo</option><option value="parcela" ${e.mode === 'parcela' ? 'selected' : ''}>Reduzir a parcela</option></select></label>
+    <div class="field full"><strong class="small" style="color:var(--text)">Depois da amortização, o banco mostrou (opcional — deixa a tabela exata):</strong></div>
+    <label>Saldo devedor (R$)<input type="number" step="0.01" min="0" name="bankBalance" value="${v('bankBalance')}"></label>
+    <label>Nova parcela (R$)<input type="number" step="0.01" min="0" name="bankInstallment" value="${v('bankInstallment')}"></label>
+    <label>Parcelas restantes<input type="number" step="1" min="0" name="bankRemaining" value="${v('bankRemaining')}"></label>
+  </div><p class="muted small">Você pode registrar agora e voltar depois (✎) para preencher os números quando o banco atualizar.</p>`;
+}
+function extraFromForm(f) {
+  const n = k => (f[k] === '' || f[k] === undefined ? '' : +f[k]);
+  if (!(+f.value > 0)) { toast('Informe o valor.'); return null; }
+  return { date: f.date, value: +f.value, mode: f.mode, bankBalance: n('bankBalance'), bankInstallment: n('bankInstallment'), bankRemaining: n('bankRemaining') };
+}
+function simulateAmort(d, value, mode) {
+  const base = financingStatus(d);
+  if (!base.next || !(value > 0)) return null;
+  const sim = financingStatus(d, financingSchedule(d, [{ date: base.next.ym + '-01', value, mode }]));
+  return { interestSaved: base.remainingInterest - sim.remainingInterest, monthsLess: base.total - sim.total, oldInstallment: base.next.total, newInstallment: sim.next ? sim.next.total : 0, newEnd: sim.endYm };
+}
+
+function consorcioSchedule(c) {
+  const n = +c.term, credit = +c.credit;
+  const base = (credit * (1 + (+c.adminFee || 0) / 100 + (+c.reserveFund || 0) / 100)) / n + (credit * (+c.insurance || 0)) / 100;
+  const adj = (+c.adjust || 0) / 100, start = c.firstDue.slice(0, 7);
+  return Array.from({ length: n }, (_, m) => ({ ym: addMonths(start, m), n: m + 1, total: base * Math.pow(1 + adj, Math.floor(m / 12)) }));
+}
+function consorcioStatus(c) {
+  const rows = consorcioSchedule(c), day = +c.firstDue.slice(8, 10);
+  const override = c.paidOverride !== '' && c.paidOverride != null;
+  const paid = override ? Math.min(+c.paidOverride, rows.length) : rows.filter(r => isPaidMonth(r.ym, day)).length;
+  const bid = c.contemplated ? +c.bid || 0 : 0;
+  const unpaid = rows.slice(paid);
+  return {
+    rows, day, paid, total: rows.length, next: unpaid[0],
+    paidTotal: sum(rows.slice(0, paid), r => r.total) + bid,
+    remaining: Math.max(0, sum(unpaid, r => r.total) - bid),
+    endYm: rows.length ? rows[rows.length - 1].ym : null,
+    pct: rows.length ? paid / rows.length : 0,
+    creditNow: +c.credit * Math.pow(1 + (+c.adjust || 0) / 100, Math.floor(Math.max(0, paid - 1) / 12)),
+  };
+}
+const debtStatus = d => (d.kind === 'consorcio' ? consorcioStatus(d) : financingStatus(d));
+function debtPaymentFor(id, ym) {
+  const d = state.debts.find(x => x.id === id); if (!d) return 0;
+  const rows = d.kind === 'consorcio' ? consorcioSchedule(d) : financingSchedule(d);
+  return round2(rows.find(r => r.ym === ym)?.total || 0);
+}
+const debtAvatar = d => avatar({ name: d.institution || d.name, type: 'corrente' });
+
+function ensureDebtTag(kind) {
+  const def = kind === 'consorcio'
+    ? { name: 'Consórcio', color: '#0d9488', icon: '🤝', group: 'essencial', exclude: false, rule: 'consorcio|consorc' }
+    : { name: 'Financiamento', color: '#4f46e5', icon: '🏡', group: 'essencial', exclude: false, rule: 'habitacao|habitacional|financiamento imob|prestacao imovel|prestacao habit' };
+  if (!state.tags.some(t => t.name === def.name)) {
+    const { rule, ...tag } = def; state.tags.push(tag);
+    state.rules.unshift({ id: uid(), pattern: rule, tag: def.name, sign: 'out' });
+  }
+  return def.name;
+}
+/** Cria/atualiza/remove o lançamento recorrente da parcela (valor calculado mês a mês). */
+function syncDebtRecurring(d, on, accountId) {
+  const idx = state.recurring.findIndex(r => r.debtId === d.id);
+  if (!on) { if (idx >= 0) state.recurring.splice(idx, 1); return; }
+  const st = debtStatus(d);
+  const base = idx >= 0 ? state.recurring[idx] : { id: uid(), generated: [], startMonth: st.next?.ym || currentMonth() };
+  Object.assign(base, { debtId: d.id, description: `Parcela ${d.name}`, amount: -round2(st.next?.total || 0), day: st.day, tag: ensureDebtTag(d.kind), accountId });
+  if (idx < 0) state.recurring.push(base);
+}
+
+function simText(d) {
+  const st = SIM[d.id];
+  if (!st || !(+st.value > 0)) return '<span class="muted">Digite um valor para ver quanto economiza de juros.</span>';
+  const r = simulateAmort(d, +st.value, st.mode || 'prazo');
+  if (!r) return '';
+  return (st.mode || 'prazo') === 'parcela'
+    ? `A parcela cai de <strong>${fmt(r.oldInstallment)}</strong> para <strong class="pos">${fmt(r.newInstallment)}</strong> e você economiza <strong class="pos">${fmt(r.interestSaved)}</strong> em juros.`
+    : `Você quita <strong class="pos">${monthsText(r.monthsLess)} antes</strong> (${r.newEnd ? monthLabel(r.newEnd) : 'agora'}) e economiza <strong class="pos">${fmt(r.interestSaved)}</strong> em juros.`;
+}
+function consSimText(c) {
+  const st = SIM[c.id] || {}; const s = consorcioStatus(c);
+  const bid = +st.bid || 0, emb = Math.min(+st.emb || 0, bid);
+  if (!bid) return '<span class="muted">Informe o % de lance para ver os valores.</span>';
+  const bidV = (s.creditNow * bid) / 100, embV = (s.creditNow * emb) / 100, own = bidV - embV;
+  const parc = s.next ? own / s.next.total : 0;
+  return `Lance de ${fmtRate(bid)} = <strong>${fmt(bidV)}</strong>${emb ? ` (${fmt(embV)} embutido na carta + <strong>${fmt(own)}</strong> do seu bolso)` : ''}. Carta liberada: <strong>${fmt(s.creditNow - embV)}</strong>.${parc ? ` O valor do seu bolso equivale a ~${parc.toFixed(1).replace('.', ',')} parcelas atuais.` : ''}`;
+}
+
+function debtProgress(s, extra = '') {
+  return `<div class="goal"><div class="goal-top"><span class="small"><strong>${s.paid}</strong> de ${s.total} parcelas pagas</span><span class="small">${pct(s.pct)} ${extra}</span></div>
+    <div class="bar"><span style="width:${Math.min(100, s.pct * 100)}%;background:var(--green)"></span></div></div>`;
+}
+
+function financingCard(d) {
+  const s = financingStatus(d);
+  const left = s.total - s.paid;
+  const pts = s.rows.filter((r, i) => i % 12 === 0 || i === s.rows.length - 1);
+  const chart = pts.length > 2 ? lineSVG(pts.map(r => r.ym.slice(2, 4)), [+d.principal, ...pts.map(r => r.saldo)].slice(1)) : '';
+  const sv = realizedSavings(d);
+  const extras = (d.extras || []).length ? `<h3 class="mt small-title">Amortizações realizadas</h3>
+    ${sv && sv.interest > 1 ? `<p class="small">✅ Você já amortizou <strong>${fmt(sv.total)}</strong> e isso economiza cerca de <strong class="pos">${fmt(sv.interest)}</strong> em juros${sv.months > 0 ? ` e <strong class="pos">${monthsText(sv.months)}</strong> de prazo` : ''}.</p>` : ''}
+    ${d.extras.map((e, i) => { const bank = [e.bankBalance !== '' && e.bankBalance != null ? 'saldo ' + fmt(e.bankBalance) : '', +e.bankInstallment ? 'parcela ' + fmt(e.bankInstallment) : '', +e.bankRemaining ? e.bankRemaining + ' parcelas restantes' : ''].filter(Boolean).join(' · ');
+      return `<div class="list-row small"><span class="ticon sm" style="--c:var(--green)">✔</span><span class="grow">${fmtDate(e.date)} · <strong>${fmt(e.value)}</strong> · ${e.mode === 'parcela' ? 'reduziu a parcela' : 'reduziu o prazo'}
+        <br><span class="${bank ? 'muted' : 'warn'}">${bank ? 'banco: ' + bank : '⚠ falta informar os números do banco'}</span></span>
+        <button class="icon-btn" title="Atualizar com os dados do banco" data-action="edit-extra" data-id="${d.id}" data-idx="${i}">✎</button><button class="icon-btn" title="Excluir" data-action="del-extra" data-id="${d.id}" data-idx="${i}">✕</button></div>`; }).join('')}` : '';
+  const next12 = s.rows.slice(s.paid, s.paid + 12);
+  return `<div class="card debt">
+    <div class="card-head"><div class="debt-title">${debtAvatar(d)}<div><h2>${esc(d.name)}</h2>
+      <div class="sub">${esc(d.institution || '')} · ${d.system === 'PRICE' ? 'Price' : 'SAC'} · ${fmtRate(d.rate)} a.a. · ${d.term} meses${+d.assetValue ? ` · bem ${fmt(d.assetValue)}` : ''}</div></div></div>
+      <div class="row-actions"><button class="icon-btn" title="Editar" data-action="edit-debt" data-id="${d.id}">✎</button><button class="icon-btn" title="Excluir" data-action="del-debt" data-id="${d.id}">✕</button></div></div>
+    ${debtProgress(s, 'quitado')}
+    <div class="debt-nums">
+      <div><span class="label">Saldo devedor</span><strong>${fmt(s.saldo)}</strong></div>
+      <div><span class="label">Próxima parcela</span><strong>${s.next ? fmt(s.next.total) : '—'}</strong><span class="muted small">${s.next ? fmtDate(dueDate(s.next.ym, s.day)) : 'quitado 🎉'}</span></div>
+      <div><span class="label">Juros a pagar</span><strong class="neg">${fmt(s.remainingInterest)}</strong></div>
+      <div><span class="label">Quitação prevista</span><strong>${s.endYm ? monthLabel(s.endYm) : '—'}</strong><span class="muted small">faltam ${monthsText(left)}</span></div>
+    </div>
+    ${chart ? `<div class="small muted">Saldo devedor ao longo do tempo (ano)</div>${chart}` : ''}
+    ${s.next ? `<div class="sim"><h3>💡 Simular amortização extra</h3>
+      <div class="toolbar"><input type="number" min="0" step="100" placeholder="Valor (R$)" data-input="sim-fin" data-id="${d.id}" value="${esc(SIM[d.id]?.value || '')}">
+        <select data-change="sim-fin-mode" data-id="${d.id}"><option value="prazo">Reduzir prazo</option><option value="parcela" ${SIM[d.id]?.mode === 'parcela' ? 'selected' : ''}>Reduzir parcela</option></select></div>
+      <div id="sim-${d.id}" class="sim-out">${simText(d)}</div></div>` : ''}
+    ${(() => { if (!d.plan?.length) return ''; const r = planResult(d, d.plan); return r ? `<p class="small">📊 Plano salvo: quita em <strong>${monthLabel(r.P.end)}</strong> e economiza <strong class="pos">${fmt(r.saved)}</strong>.</p>` : ''; })()}
+    <div class="toolbar mt"><button class="btn small primary" data-action="open-sim" data-id="${d.id}">📊 Simulador completo</button>
+      <button class="btn small" data-action="add-extra" data-id="${d.id}">+ Registrar amortização feita</button>
+      <button class="btn small" data-action="anchor-debt" data-id="${d.id}">🏦 Atualizar pelos dados do banco</button></div>
+    ${extras}
+    ${d.anchor ? `<p class="small muted">Ajustado pelo banco antes da parcela de ${monthLabel(d.anchor.ym)}: saldo ${fmt(d.anchor.balance)}${+d.anchor.installment ? ' · parcela ' + fmt(d.anchor.installment) : ''}${+d.anchor.remaining ? ' · ' + d.anchor.remaining + ' parcelas restantes' : ''}.</p>` : ''}
+    <details><summary>Próximas parcelas</summary><div class="table-wrap"><table><thead><tr><th>Nº</th><th>Vencimento</th><th class="num">Amortização</th><th class="num">Juros</th><th class="num">Seguros/taxas</th><th class="num">Parcela</th><th class="num">Saldo após</th></tr></thead>
+      <tbody>${next12.map(r => `<tr><td>${r.n}</td><td>${fmtDate(dueDate(r.ym, s.day))}</td><td class="num">${fmt(r.amort)}</td><td class="num">${fmt(r.juros)}</td><td class="num">${fmt(r.fees)}</td><td class="num"><strong>${fmt(r.total)}</strong></td><td class="num">${fmt(r.saldo)}</td></tr>`).join('')}</tbody></table></div></details>
+  </div>`;
+}
+
+function consorcioCard(c) {
+  const s = consorcioStatus(c);
+  return `<div class="card debt">
+    <div class="card-head"><div class="debt-title">${debtAvatar(c)}<div><h2>${esc(c.name)}</h2>
+      <div class="sub">${esc(c.institution || '')} · carta ${fmt(s.creditNow)} · ${c.term} meses</div></div></div>
+      <div class="row-actions"><button class="icon-btn" title="Editar" data-action="edit-debt" data-id="${c.id}">✎</button><button class="icon-btn" title="Excluir" data-action="del-debt" data-id="${c.id}">✕</button></div></div>
+    <p>${c.contemplated ? `<span class="pill badge-ok">✓ Contemplado${c.contemplatedDate ? ' em ' + fmtDate(c.contemplatedDate) : ''}</span>${+c.bid ? ` <span class="small muted">lance de ${fmt(c.bid)}</span>` : ''}` : '<span class="pill">⏳ Aguardando contemplação</span>'}</p>
+    ${debtProgress(s, 'pago')}
+    <div class="debt-nums">
+      <div><span class="label">Parcela atual</span><strong>${s.next ? fmt(s.next.total) : '—'}</strong><span class="muted small">${s.next ? 'vence ' + fmtDate(dueDate(s.next.ym, s.day)) : 'encerrado 🎉'}</span></div>
+      <div><span class="label">Total pago</span><strong>${fmt(s.paidTotal)}</strong></div>
+      <div><span class="label">Falta pagar</span><strong class="neg">${fmt(s.remaining)}</strong></div>
+      <div><span class="label">Encerramento</span><strong>${s.endYm ? monthLabel(s.endYm) : '—'}</strong><span class="muted small">faltam ${monthsText(s.total - s.paid)}</span></div>
+    </div>
+    <p class="small muted">Taxa de administração ${fmtRate(c.adminFee)} · fundo de reserva ${fmtRate(c.reserveFund)}${+c.insurance ? ` · seguro ${fmtRate(c.insurance)} a.m.` : ''}${+c.adjust ? ` · reajuste estimado ${fmtRate(c.adjust)} a.a.` : ''}</p>
+    ${!c.contemplated && s.next ? `<div class="sim"><h3>🎯 Simular lance</h3>
+      <div class="toolbar"><label class="field">Lance (% da carta)<input type="number" min="0" max="100" step="1" data-input="sim-cons" data-field="bid" data-id="${c.id}" value="${esc(SIM[c.id]?.bid || '')}"></label>
+        <label class="field">Lance embutido (%)<input type="number" min="0" max="30" step="1" data-input="sim-cons" data-field="emb" data-id="${c.id}" value="${esc(SIM[c.id]?.emb || '')}"></label></div>
+      <div id="csim-${c.id}" class="sim-out">${consSimText(c)}</div>
+      <p class="small muted">Calculado sobre a carta atualizada; algumas administradoras calculam sobre o saldo devedor.</p></div>` : ''}
+  </div>`;
+}
+
+/* ---------- simulador completo de amortização ---------- */
+const FREQS = { 0: 'uma vez', 1: 'todo mês', 6: 'a cada 6 meses', 12: 'todo ano', 24: 'a cada 2 anos' };
+function expandPlan(items, fromYm, untilYm) {
+  const out = [];
+  for (const it of items) {
+    const v = +it.value, f = +it.every || 0;
+    if (!(v > 0)) continue;
+    let ym = it.start || fromYm;
+    if (f) while (ym < fromYm) ym = addMonths(ym, f);       // recorrente que começou antes: alinha no próximo
+    else if (ym < fromYm) ym = fromYm;
+    const end = it.end && it.end < untilYm ? it.end : untilYm;
+    for (let k = 0; ym <= end && k < 1200; k++) { out.push({ date: ym + '-01', value: v, mode: it.mode || 'prazo' }); if (!f) break; ym = addMonths(ym, f); }
+  }
+  return out;
+}
+function planResult(d, items) {
+  const base = financingStatus(d);
+  if (!base.next) return null;
+  const from = base.next.ym;
+  const plan = financingStatus(d, financingSchedule(d, expandPlan(items, from, base.endYm)));
+  const fut = st => {
+    const extra = sum(Object.entries(st.rows.applied).filter(([ym]) => ym >= from), ([, v]) => v);
+    return { st, months: st.total - st.paid, interest: st.remainingInterest, parcels: st.remainingTotal, extra, out: st.remainingTotal + extra, end: st.endYm, next: st.next ? st.next.total : 0 };
+  };
+  const A = fut(base), P = fut(plan);
+  return { from, A, P, saved: A.out - P.out, monthsLess: A.months - P.months };
+}
+
+function lineMultiSVG(labels, series, { height = 220 } = {}) {
+  const W = 640, H = height, L = 56, B = 24, T = 10;
+  const all = series.flatMap(s => s.values).filter(v => v != null);
+  const max = Math.max(1, ...all), min = Math.min(0, ...all), range = max - min || 1;
+  const x = i => L + ((W - L - 12) * i) / Math.max(1, labels.length - 1);
+  const y = v => T + (H - T - B) * (1 - (v - min) / range);
+  let g = '';
+  for (let k = 0; k <= 4; k++) { const v = min + (range * k) / 4; g += `<line class="grid-line" x1="${L}" x2="${W}" y1="${y(v)}" y2="${y(v)}"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${fmtShort(v).replace('R$ ', '')}</text>`; }
+  const step = Math.ceil(labels.length / 12);
+  labels.forEach((l, i) => { if (i % step === 0 || i === labels.length - 1) g += `<text x="${x(i)}" y="${H - 6}" text-anchor="middle">${esc(l)}</text>`; });
+  for (const s of series) {
+    const pts = s.values.map((v, i) => (v == null ? null : `${x(i)},${y(v)}`)).filter(Boolean);
+    g += `<polyline points="${pts.join(' ')}" fill="none" stroke="${s.color}" stroke-width="2.5" stroke-linejoin="round" ${s.dash ? 'stroke-dasharray="6 5"' : ''}/>`;
+    s.values.forEach((v, i) => { if (v != null) g += `<circle cx="${x(i)}" cy="${y(v)}" r="6" fill="transparent"><title>${esc(s.label)} — ${esc(labels[i])}: ${fmt(v)}</title></circle>`; });
+  }
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}">${g}</svg><div class="chart-legend">${series.map(s => `<span><span class="dot" style="background:${s.color}"></span> ${esc(s.label)}</span>`).join('')}</div>`;
+}
+
+function viewSimulator() {
+  const d = state.debts.find(x => x.id === ui.sim.debtId);
+  if (!d) { ui.sim = null; return viewDebts(); }
+  const items = ui.sim.items;
+  const r = planResult(d, items);
+  const head = `<div class="page-head"><div><button class="btn small ghost" data-action="close-sim">← Voltar</button>
+    <h1>Simulador de amortização</h1><p>${esc(d.name)} · ${esc(d.institution || '')} · ${d.system === 'PRICE' ? 'Price' : 'SAC'} · ${fmtRate(d.rate)} a.a.</p></div></div>`;
+  if (!r) return head + '<div class="card empty-state"><h2>Financiamento quitado 🎉</h2></div>';
+  const { from, A, P } = r;
+  const nextLabel = monthLabel(from);
+
+  const hero = items.length
+    ? `<div class="card sim-hero"><div class="sim-hero-icon">🎉</div><div>
+        <div class="big-number pos">Economia de ${fmt(r.saved)}</div>
+        <div>Com esse plano você quita em <strong>${monthLabel(P.end)}</strong>${r.monthsLess > 0 ? ` — <strong>${monthsText(r.monthsLess)} antes</strong> do previsto (${monthLabel(A.end)})` : ''}.
+        ${P.next && Math.abs(P.next - A.next) > 0.5 ? ` A próxima parcela fica em <strong>${fmt(P.next)}</strong> (hoje ${fmt(A.next)}).` : ''}</div></div></div>`
+    : `<div class="card sim-hero"><div class="sim-hero-icon">💡</div><div><strong>Monte seu plano abaixo</strong><div class="muted">Adicione amortizações únicas ou recorrentes (todo mês, 13º, FGTS a cada 2 anos…) e veja na hora quando quita e quanto economiza.</div></div></div>`;
+
+  const freqOpts = Object.entries(FREQS).map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
+  const builder = `<div class="card"><h2>Seu plano de amortizações</h2><div class="sub">próxima parcela em ${nextLabel} · as amortizações entram antes da parcela do mês</div>
+    <div class="toolbar"><span class="small muted">Atalhos:</span>
+      <button class="btn small" data-action="sim-preset" data-value="500" data-every="1" data-start="${from}">R$ 500 todo mês</button>
+      <button class="btn small" data-action="sim-preset" data-value="3000" data-every="12" data-start="${from.slice(0, 4)}-12">13º salário (dezembro)</button>
+      <button class="btn small" data-action="sim-preset" data-value="15000" data-every="24" data-start="${from}">FGTS a cada 2 anos</button>
+      <button class="btn small" data-action="sim-preset" data-value="20000" data-every="0" data-start="${from}">Valor único</button></div>
+    <div class="form-grid sim-form">
+      <label>Valor (R$)<input type="number" id="sp-value" min="0" step="100" placeholder="1000"></label>
+      <label>Frequência<select id="sp-every">${freqOpts}</select></label>
+      <label>A partir de<input type="month" id="sp-start" value="${from}" min="${from}"></label>
+      <label>Até (opcional)<input type="month" id="sp-end"></label>
+      <label class="full">Efeito<select id="sp-mode"><option value="prazo">Reduzir o prazo (economiza mais juros)</option><option value="parcela">Reduzir o valor da parcela</option></select></label>
+    </div>
+    <div class="toolbar mt"><button class="btn primary" data-action="sim-add">+ Adicionar ao plano</button></div>
+    ${items.length ? items.map((it, i) => `<div class="list-row"><span class="ticon sm" style="--c:var(--green)">${+it.every ? '🔁' : '💵'}</span>
+      <span class="grow"><strong>${fmt(it.value)}</strong> · ${FREQS[+it.every || 0]} · ${+it.every ? 'desde' : 'em'} ${monthShort(it.start)}${it.end ? ' até ' + monthShort(it.end) : ''}
+      <br><span class="muted small">${it.mode === 'parcela' ? 'reduz a parcela' : 'reduz o prazo'}</span></span>
+      <button class="btn small soft" data-action="sim-realize" data-idx="${i}" title="Registrar como realizada">✔ Realizei</button>
+      <button class="icon-btn" data-action="sim-del" data-idx="${i}">✕</button></div>`).join('') : '<p class="muted small">Nenhuma amortização no plano ainda.</p>'}
+    <div class="toolbar mt"><button class="btn" data-action="sim-save">💾 Salvar plano</button>${items.length ? '<button class="btn ghost" data-action="sim-clear">Limpar</button>' : ''}
+      ${JSON.stringify(d.plan || []) !== JSON.stringify(items) ? '<span class="small muted">alterações não salvas</span>' : (items.length ? '<span class="small pos">plano salvo ✓</span>' : '')}</div>
+  </div>`;
+
+  const diff = (a, b, invert) => { const v = b - a; if (Math.abs(v) < 0.5) return '<span class="muted">—</span>'; const good = invert ? v > 0 : v < 0; return `<span class="${good ? 'pos' : 'neg'}">${v > 0 ? '+' : '−'}${fmt(Math.abs(v))}</span>`; };
+  const compare = `<div class="card"><h2>Hoje × com o plano</h2><div class="sub">a partir de ${nextLabel}</div>
+    <div class="table-wrap"><table class="compare"><thead><tr><th></th><th class="num">Sem amortizar</th><th class="num">Com o plano</th><th class="num">Diferença</th></tr></thead><tbody>
+      <tr><td>Quitação</td><td class="num">${monthLabel(A.end)}</td><td class="num"><strong>${monthLabel(P.end)}</strong></td><td class="num">${r.monthsLess > 0 ? `<span class="pos">${monthsText(r.monthsLess)} antes</span>` : '<span class="muted">—</span>'}</td></tr>
+      <tr><td>Parcelas restantes</td><td class="num">${A.months}</td><td class="num"><strong>${P.months}</strong></td><td class="num">${A.months - P.months ? `<span class="pos">−${A.months - P.months}</span>` : '<span class="muted">—</span>'}</td></tr>
+      <tr><td>Próxima parcela</td><td class="num">${fmt(A.next)}</td><td class="num"><strong>${fmt(P.next)}</strong></td><td class="num">${diff(A.next, P.next)}</td></tr>
+      <tr><td>Juros a pagar</td><td class="num">${fmt(A.interest)}</td><td class="num"><strong>${fmt(P.interest)}</strong></td><td class="num">${diff(A.interest, P.interest)}</td></tr>
+      <tr><td>Parcelas (soma)</td><td class="num">${fmt(A.parcels)}</td><td class="num">${fmt(P.parcels)}</td><td class="num">${diff(A.parcels, P.parcels)}</td></tr>
+      <tr><td>Amortizações extras</td><td class="num">—</td><td class="num">${fmt(P.extra)}</td><td class="num"></td></tr>
+      <tr class="total"><td><strong>Total a desembolsar</strong></td><td class="num"><strong>${fmt(A.out)}</strong></td><td class="num"><strong>${fmt(P.out)}</strong></td><td class="num"><strong>${diff(A.out, P.out)}</strong></td></tr>
+    </tbody></table></div></div>`;
+
+  // séries anuais para os gráficos
+  const ks = []; for (let k = 0; k < A.months; k += 12) ks.push(k); ks.push(A.months - 1);
+  const rowAt = (st, ym) => st.rows.find(x => x.ym === ym);
+  const labels = ks.map(k => addMonths(from, k).slice(0, 4));
+  const val = (st, end, k, f) => { const ym = addMonths(from, k); const row = rowAt(st, ym); return row ? f(row) : (ym > end ? (f === saldoF ? 0 : null) : null); };
+  const saldoF = x => x.saldo, parcF = x => x.total;
+  const charts = `<div class="grid two">
+    <div class="card"><h2>Saldo devedor</h2><div class="sub">no início de cada ano</div>${lineMultiSVG(labels, [
+      { label: 'Sem amortizar', color: 'var(--muted)', dash: true, values: ks.map(k => val(A.st, A.end, k, saldoF)) },
+      { label: 'Com o plano', color: 'var(--green)', values: ks.map(k => val(P.st, P.end, k, saldoF)) }])}</div>
+    <div class="card"><h2>Valor da parcela</h2><div class="sub">parcela + seguros/taxas</div>${lineMultiSVG(labels, [
+      { label: 'Sem amortizar', color: 'var(--muted)', dash: true, values: ks.map(k => val(A.st, A.end, k, parcF)) },
+      { label: 'Com o plano', color: 'var(--blue)', values: ks.map(k => val(P.st, P.end, k, parcF)) }])}</div></div>`;
+
+  const y0 = +from.slice(0, 4), y1 = +A.end.slice(0, 4);
+  const yr = [];
+  for (let y = y0; y <= y1; y++) {
+    const inY = st => st.rows.filter(x => x.ym >= from && x.ym.startsWith(String(y)));
+    const a = inY(A.st), b = inY(P.st);
+    const ex = sum(Object.entries(P.st.rows.applied).filter(([ym]) => ym >= from && ym.startsWith(String(y))), ([, v]) => v);
+    yr.push(`<tr><td>${y}</td><td class="num">${a.length ? fmt(sum(a, x => x.total) / a.length) : '—'}</td><td class="num">${b.length ? fmt(sum(b, x => x.total) / b.length) : (ex ? '—' : '<span class="pos">quitado</span>')}</td>
+      <td class="num">${ex ? fmt(ex) : '—'}</td><td class="num">${fmt(a.length ? a[a.length - 1].saldo : 0)}</td><td class="num"><strong>${fmt(b.length ? b[b.length - 1].saldo : 0)}</strong></td></tr>`);
+  }
+  const table = `<div class="card mt"><h2>Ano a ano</h2><div class="table-wrap"><table><thead><tr><th>Ano</th><th class="num">Parcela média (hoje)</th><th class="num">Parcela média (plano)</th><th class="num">Amortização extra</th><th class="num">Saldo fim do ano (hoje)</th><th class="num">Saldo fim do ano (plano)</th></tr></thead>
+    <tbody>${yr.join('')}</tbody></table></div>
+    <p class="small muted">Simulação sem TR e com seguros fixos — use "🏦 Atualizar pelos dados do banco" para partir do saldo real. Confirme as regras de amortização e uso do FGTS com o banco.</p></div>`;
+
+  return head + hero + `<div class="grid two">${builder}${compare}</div>` + charts + table;
+}
+
+function viewDebts() {
+  if (ui.sim) return viewSimulator();
+  const head = `<div class="page-head"><div><h1>Financiamentos e consórcios</h1><p>Saldo devedor, parcelas, quitação, amortizações e lances</p></div>
+    <div class="toolbar"><button class="btn" data-action="add-debt" data-kind="consorcio">+ Consórcio</button><button class="btn primary" data-action="add-debt" data-kind="financiamento">+ Financiamento</button></div></div>`;
+  if (!state.debts.length) {
+    return head + `<div class="card empty-state"><h2>Nenhum financiamento ou consórcio</h2>
+      <p>Cadastre seu financiamento imobiliário (SAC ou Price) e seus consórcios para acompanhar saldo devedor, parcelas que faltam, data de quitação, quanto economiza amortizando e simular lances.</p>
+      <button class="btn primary" data-action="add-debt" data-kind="financiamento">+ Financiamento</button> <button class="btn" data-action="add-debt" data-kind="consorcio">+ Consórcio</button></div>`;
+  }
+  const fins = state.debts.filter(d => d.kind !== 'consorcio');
+  const cons = state.debts.filter(d => d.kind === 'consorcio');
+  const saldoDev = sum(fins, d => financingStatus(d).saldo);
+  const consLeft = sum(cons, d => consorcioStatus(d).remaining);
+  const dueMonth = sum(state.debts, d => debtPaymentFor(d.id, ui.month));
+  const income = monthSummary(ui.month).receitas;
+  const goods = sum(fins, d => +d.assetValue || 0);
+  const assets = sum(state.accounts.filter(a => a.type !== 'cartao'), a => accountBalance(a)) + portfolio().totals.value + goods;
+  const cardDebt = sum(state.accounts.filter(a => a.type === 'cartao'), a => Math.max(0, -accountBalance(a)));
+  const net = assets - saldoDev - cardDebt;
+  const kpis = `<div class="grid kpis">
+    <div class="card kpi"><div class="label">Saldo devedor (financiamentos)</div><div class="value neg">${fmt(saldoDev)}</div></div>
+    <div class="card kpi"><div class="label">Parcelas em ${monthLabel(ui.month)}</div><div class="value">${fmt(dueMonth)}</div><div class="hint">${income ? pct(dueMonth / income) + ' da receita do mês' : 'sem receitas no mês'}</div></div>
+    <div class="card kpi"><div class="label">Falta pagar nos consórcios</div><div class="value">${fmt(consLeft)}</div></div>
+    <div class="card kpi"><div class="label">Patrimônio líquido</div><div class="value ${net >= 0 ? 'pos' : 'neg'}">${fmt(net)}</div><div class="hint">contas + investimentos${goods ? ' + bens' : ''} − dívidas</div></div>
+  </div>`;
+  return head + kpis + `<div class="grid debt-grid">${fins.map(financingCard).join('')}${cons.map(consorcioCard).join('')}</div>`;
+}
+
+function debtsMini() {
+  if (!state.debts.length) return '';
+  return `<div class="card-head mt"><h2>Financiamentos e consórcios</h2><button class="btn small" data-action="nav" data-view="debts">Ver tudo →</button></div>
+    ${state.debts.map(d => { const s = debtStatus(d); return `<div class="list-row clickable" data-action="nav" data-view="debts">${debtAvatar(d)}
+      <span class="grow"><strong>${esc(d.name)}</strong><br><span class="muted small">${s.paid}/${s.total} parcelas · ${d.kind === 'consorcio' ? 'falta ' + fmt(s.remaining) : 'saldo ' + fmt(s.saldo)}</span>
+      <span class="bar"><span style="width:${Math.min(100, s.pct * 100)}%;background:var(--green)"></span></span></span>
+      <span class="small">${s.next ? fmt(s.next.total) : '✓'}</span></div>`; }).join('')}`;
+}
+
+function debtForm(d = {}, kind) {
+  const rec = d.id ? state.recurring.find(r => r.debtId === d.id) : null;
+  const n = (name, label, val, attrs = '') => `<label>${label}<input type="number" step="any" name="${name}" value="${val ?? ''}" ${attrs}></label>`;
+  const common = `<label class="full">Nome<input type="text" name="name" required value="${esc(d.name || '')}" placeholder="${kind === 'consorcio' ? 'Consórcio do carro' : 'Apartamento'}"></label>
+    <label>${kind === 'consorcio' ? 'Administradora' : 'Banco'}<input type="text" name="institution" value="${esc(d.institution || '')}" placeholder="${kind === 'consorcio' ? 'Porto, Embracon, Itaú…' : 'Caixa'}"></label>
+    <label>Vencimento da 1ª parcela<input type="date" name="firstDue" required value="${d.firstDue || todayISO()}"></label>`;
+  const fields = kind === 'consorcio' ? `
+    ${n('credit', 'Valor da carta de crédito (R$)', d.credit, 'required min="0"')}
+    ${n('term', 'Prazo (meses)', d.term, 'required min="1" step="1"')}
+    ${n('adminFee', 'Taxa de administração total (%)', d.adminFee ?? 15)}
+    ${n('reserveFund', 'Fundo de reserva (%)', d.reserveFund ?? 2)}
+    ${n('insurance', 'Seguro (% a.m. da carta, opcional)', d.insurance)}
+    ${n('adjust', 'Reajuste anual estimado (% — INCC/IPCA)', d.adjust ?? 0)}
+    ${n('paidOverride', 'Parcelas já pagas (opcional, se diferente do calendário)', d.paidOverride, 'min="0" step="1"')}
+    <label class="check full"><input type="checkbox" name="contemplated" ${d.contemplated ? 'checked' : ''}> Já fui contemplado</label>
+    <label>Data da contemplação<input type="date" name="contemplatedDate" value="${d.contemplatedDate || ''}"></label>
+    ${n('bid', 'Lance pago (R$, abate do saldo)', d.bid)}` : `
+    <label>Sistema de amortização<select name="system"><option value="SAC" ${d.system !== 'PRICE' ? 'selected' : ''}>SAC (parcelas decrescentes)</option><option value="PRICE" ${d.system === 'PRICE' ? 'selected' : ''}>Price (parcelas fixas)</option></select></label>
+    ${n('principal', 'Valor financiado (R$)', d.principal, 'required min="0"')}
+    ${n('rate', 'Juros efetivos (% ao ano)', d.rate, 'required min="0"')}
+    ${n('term', 'Prazo total (meses)', d.term, 'required min="1" step="1"')}
+    ${n('fees', 'Seguros + taxa mensal (R$ — MIP, DFI, adm.)', d.fees ?? 0)}
+    ${n('assetValue', 'Valor atual do imóvel/bem (R$, opcional — entra no patrimônio)', d.assetValue)}`;
+  return `<div class="form-grid">${common}${fields}
+    <label class="check full"><input type="checkbox" name="autoTx" ${rec ? 'checked' : ''}> Lançar a parcela automaticamente todo mês (valor calculado pela tabela)</label>
+    <label class="full">Conta de débito<select name="accountId">${accountOptions(rec?.accountId || state.accounts[0]?.id)}</select></label>
+  </div>${kind === 'consorcio' ? '' : '<p class="muted small">Dica: os dados estão no contrato ou no app Habitação Caixa. A TR não é prevista — use "🏦 Atualizar pelos dados do banco" de vez em quando para ficar exato.</p>'}`;
+}
+function saveDebt(existing, kind, d) {
+  const num = k => (d[k] === '' || d[k] === undefined ? '' : +d[k]);
+  const obj = existing || { id: uid(), kind, extras: [] };
+  Object.assign(obj, { name: d.name.trim(), institution: d.institution.trim(), firstDue: d.firstDue });
+  if (kind === 'consorcio') Object.assign(obj, { credit: num('credit'), term: num('term'), adminFee: num('adminFee') || 0, reserveFund: num('reserveFund') || 0, insurance: num('insurance') || 0, adjust: num('adjust') || 0, paidOverride: num('paidOverride'), contemplated: d.contemplated, contemplatedDate: d.contemplatedDate, bid: num('bid') || 0 });
+  else Object.assign(obj, { system: d.system, principal: num('principal'), rate: num('rate'), term: num('term'), fees: num('fees') || 0, assetValue: num('assetValue') || 0 });
+  if (!existing) state.debts.push(obj);
+  ensureDebtTag(kind);
+  syncDebtRecurring(obj, d.autoTx, d.accountId);
+  runRecurring();
+}
+
 function viewImport() {
   const p = ui.pendingImport;
   let preview = '';
@@ -881,7 +1319,7 @@ function viewSettings() {
   </div>`;
 }
 
-const VIEWS = { overview: viewOverview, transactions: viewTransactions, investments: viewInvestments, import: viewImport, settings: viewSettings };
+const VIEWS = { overview: viewOverview, transactions: viewTransactions, investments: viewInvestments, debts: viewDebts, import: viewImport, settings: viewSettings };
 function render() {
   document.querySelectorAll('#tabs button, #bottom-nav button[data-view]').forEach(b => b.classList.toggle('active', b.dataset.view === ui.view));
   $('#hide-btn').textContent = prefs.hide ? '🙈' : '👁';
@@ -1120,6 +1558,12 @@ function loadDemo() {
   for (let i = -9; i <= 0; i++) { op(mxrf, i, 'provento', 1, 6.5 + (i > -3 ? 2.7 : 0) * 1); op(hglg, i, 'provento', 1, 27.5); }
   op(petr, -4, 'provento', 1, 210); op(itub, -2, 'provento', 1, 95); op(petr, -5, 'venda', 30, 39.9);
   state = s;
+  ensureDebtTag('financiamento'); ensureDebtTag('consorcio');
+  state.debts = [
+    { id: uid(), kind: 'financiamento', name: 'Apartamento', institution: 'Caixa', system: 'SAC', principal: 320000, rate: 9.5, term: 360, fees: 110, assetValue: 460000, firstDue: `${addMonths(currentMonth(), -47)}-15`, extras: [{ date: `${addMonths(currentMonth(), -10)}-20`, value: 15000, mode: 'prazo' }] },
+    { id: uid(), kind: 'consorcio', name: 'Consórcio do carro', institution: 'Porto Consórcio', credit: 90000, term: 72, adminFee: 14, reserveFund: 2, insurance: 0, adjust: 4, paidOverride: '', contemplated: false, firstDue: `${addMonths(currentMonth(), -20)}-10`, bid: 0 },
+    { id: uid(), kind: 'consorcio', name: 'Consórcio imóvel', institution: 'Itaú Consórcio', credit: 300000, term: 200, adminFee: 19, reserveFund: 2, insurance: 0, adjust: 5, paidOverride: '', contemplated: true, contemplatedDate: `${addMonths(currentMonth(), -3)}-12`, firstDue: `${addMonths(currentMonth(), -14)}-20`, bid: 45000 },
+  ];
   const total = portfolio().totals.value;
   for (let i = -11; i <= 0; i++) inv.history[addMonths(currentMonth(), i)] = round2(total * (0.62 + 0.38 * ((i + 11) / 11)) * (0.97 + rnd() * 0.06));
   inv.history[currentMonth()] = round2(total);
@@ -1130,7 +1574,7 @@ function suggestTagWith(rules, desc, amount) { const old = state.rules; state.ru
 
 /* ================================================================ actions */
 const actions = {
-  nav: el => { if ($('#modal').open) $('#modal').close(); ui.view = el.dataset.view; render(); window.scrollTo(0, 0); },
+  nav: el => { if ($('#modal').open) $('#modal').close(); ui.sim = null; ui.view = el.dataset.view; render(); window.scrollTo(0, 0); },
   'toggle-hide': () => { prefs.hide = !prefs.hide; savePrefs(); render(); },
   'hide-onboarding': () => { prefs.hideOnboarding = true; savePrefs(); render(); },
   'onboarding-go': el => { if (el.dataset.go === 'budgets') return actions['edit-budgets'](); ui.view = el.dataset.go; render(); window.scrollTo(0, 0); },
@@ -1286,6 +1730,61 @@ const actions = {
   reset: () => { if (confirm('Apagar TODOS os dados? Exporte um backup antes.' + (Sync.enabled() ? '\n\nA sincronização está ativa: os dados também serão apagados na nuvem e nos outros aparelhos.' : ''))) { state = defaultState(); save(); render(); } },
   'modal-cancel': () => { ui.pendingSync = null; $('#modal').close(); },
   'clear-logo': () => {},
+  'open-sim': el => { const d = state.debts.find(x => x.id === el.dataset.id); ui.sim = { debtId: d.id, items: JSON.parse(JSON.stringify(d.plan || [])) }; ui.view = 'debts'; render(); window.scrollTo(0, 0); },
+  'close-sim': () => { ui.sim = null; render(); window.scrollTo(0, 0); },
+  'sim-preset': el => { $('#sp-value').value = el.dataset.value; $('#sp-every').value = el.dataset.every; $('#sp-start').value = el.dataset.start; $('#sp-end').value = ''; $('#sp-value').focus(); $('#sp-value').select(); },
+  'sim-add': () => {
+    const value = +$('#sp-value').value;
+    if (!(value > 0)) return toast('Informe o valor da amortização.');
+    ui.sim.items.push({ value, every: +$('#sp-every').value, start: $('#sp-start').value || currentMonth(), end: $('#sp-end').value || '', mode: $('#sp-mode').value });
+    render();
+  },
+  'sim-del': el => { ui.sim.items.splice(+el.dataset.idx, 1); render(); },
+  'sim-clear': () => { ui.sim.items = []; render(); },
+  'sim-save': () => { const d = state.debts.find(x => x.id === ui.sim.debtId); d.plan = JSON.parse(JSON.stringify(ui.sim.items)); save(); render(); toast('Plano salvo.'); },
+  'more-menu': () => openModal('Mais', `<div class="quick quick-grid">
+      <button class="qa" data-action="nav" data-view="debts"><span class="qa-i">🏡</span>Financiamentos e consórcios</button>
+      <button class="qa" data-action="nav" data-view="import"><span class="qa-i">⬆</span>Importar extrato</button>
+      <button class="qa" data-action="nav" data-view="settings"><span class="qa-i">⚙</span>Configurações</button></div>`, null, { noSubmit: true }),
+  'add-debt': el => { const kind = el.dataset.kind; openModal(kind === 'consorcio' ? 'Novo consórcio' : 'Novo financiamento', debtForm({}, kind), d => saveDebt(null, kind, d)); },
+  'edit-debt': el => { const x = state.debts.find(d => d.id === el.dataset.id); openModal(`Editar ${x.name}`, debtForm(x, x.kind), d => saveDebt(x, x.kind, d)); },
+  'del-debt': el => {
+    const x = state.debts.find(d => d.id === el.dataset.id);
+    if (!confirm(`Excluir "${x.name}"? As transações já lançadas continuam.`)) return;
+    state.debts = state.debts.filter(d => d !== x); state.recurring = state.recurring.filter(r => r.debtId !== x.id); save(); render();
+  },
+  'add-extra': el => {
+    const x = state.debts.find(d => d.id === el.dataset.id);
+    openModal('Registrar amortização realizada', extraForm(), f => { const e = extraFromForm(f); if (!e) return false; (x.extras = x.extras || []).push(e); toast('Amortização registrada.'); });
+  },
+  'edit-extra': el => {
+    const x = state.debts.find(d => d.id === el.dataset.id); const i = +el.dataset.idx;
+    openModal('Atualizar amortização', extraForm(x.extras[i]), f => { const e = extraFromForm(f); if (!e) return false; x.extras[i] = e; });
+  },
+  'sim-realize': el => {
+    const x = state.debts.find(d => d.id === ui.sim.debtId); const idx = +el.dataset.idx; const it = ui.sim.items[idx];
+    const st = financingStatus(x); const occ = expandPlan([it], st.next ? st.next.ym : currentMonth(), '9999-12')[0];
+    openModal('Concretizar amortização', extraForm({ date: todayISO(), value: it.value, mode: it.mode }), f => {
+      const e = extraFromForm(f); if (!e) return false;
+      (x.extras = x.extras || []).push(e);
+      if (+it.every && occ) it.start = addMonths(occ.date.slice(0, 7), +it.every); else ui.sim.items.splice(idx, 1);
+      x.plan = JSON.parse(JSON.stringify(ui.sim.items));
+      toast('Amortização registrada! Quando o banco atualizar, informe os novos números em ✎.', 7000);
+    }, { submitLabel: 'Registrar como realizada' });
+  },
+  'del-extra': el => { const x = state.debts.find(d => d.id === el.dataset.id); x.extras.splice(+el.dataset.idx, 1); save(); render(); },
+  'anchor-debt': el => {
+    const x = state.debts.find(d => d.id === el.dataset.id); const st = financingStatus(x);
+    if (!st.next) return toast('Financiamento já quitado.');
+    const cur = x.anchor && x.anchor.ym === st.next.ym ? x.anchor : {};
+    openModal('Atualizar pelos dados do banco', `<p class="muted small">Abra o app do banco e copie os números <strong>antes da parcela de ${monthLabel(st.next.ym)}</strong>. A tabela passa a ser calculada a partir deles (inclui TR, correções e amortizações que o banco já aplicou).</p>
+      <div class="form-grid">
+        <label class="full">Saldo devedor hoje (R$)<input type="number" step="0.01" min="0" name="balance" required value="${cur.balance ?? round2(st.saldo)}"></label>
+        <label>Valor da próxima parcela (R$, opcional)<input type="number" step="0.01" min="0" name="installment" value="${cur.installment ?? ''}"></label>
+        <label>Parcelas restantes (opcional)<input type="number" step="1" min="0" name="remaining" value="${cur.remaining ?? ''}"></label>
+      </div>`,
+      f => { x.anchor = { ym: st.next.ym, balance: +f.balance, installment: f.installment === '' ? '' : +f.installment, remaining: f.remaining === '' ? '' : +f.remaining }; toast('Financiamento atualizado com os dados do banco.'); });
+  },
   'pick-icon': el => {
     const f = el.closest('form'); f.icon.value = el.dataset.icon;
     f.querySelectorAll('.icon-grid .sel').forEach(b => b.classList.remove('sel')); el.classList.add('sel');
@@ -1422,6 +1921,7 @@ document.addEventListener('change', e => {
   }
   const k = el.dataset.change; if (!k) return;
   if (k === 'tx-tag') { const t = state.transactions.find(x => x.id === el.dataset.id); t.tag = el.value; save(); if (ui.view === 'transactions') render(); }
+  else if (k === 'sim-fin-mode') { const id = el.dataset.id; SIM[id] = { ...SIM[id], mode: el.value }; $('#sim-' + id).innerHTML = simText(state.debts.find(d => d.id === id)); }
   else if (k === 'filter-month') { ui.filters.month = el.value; render(); }
   else if (k === 'filter-tag') { ui.filters.tag = el.value; render(); }
   else if (k === 'filter-account') { ui.filters.account = el.value; render(); }
@@ -1437,6 +1937,8 @@ document.addEventListener('input', e => {
     clearTimeout(inputTimer);
     inputTimer = setTimeout(() => { const pos = e.target.selectionStart; render(); const i = $('[data-input=filter-q]'); i.focus(); i.setSelectionRange(pos, pos); }, 250);
   }
+  if (k === 'sim-fin') { const id = e.target.dataset.id; SIM[id] = { ...SIM[id], value: e.target.value }; $('#sim-' + id).innerHTML = simText(state.debts.find(d => d.id === id)); }
+  if (k === 'sim-cons') { const id = e.target.dataset.id; SIM[id] = { ...SIM[id], [e.target.dataset.field]: e.target.value }; $('#csim-' + id).innerHTML = consSimText(state.debts.find(d => d.id === id)); }
   if (k === 'set-name') { state.settings.name = e.target.value; save(); }
   if (k === 'set-token') { state.settings.brapiToken = e.target.value; save(); }
 });

@@ -26,6 +26,18 @@ Roda 100% no navegador, sem servidor e sem instalação: **abra o `index.html`**
 - **Cotações automáticas**: B3 via [brapi.dev](https://brapi.dev) (token gratuito em Configurações) e cripto via CoinGecko
 - Renda fixa/Tesouro: informe o valor atual de vez em quando (✎)
 
+**Financiamentos e consórcios**
+- Financiamento imobiliário **SAC ou Price**: saldo devedor, parcelas pagas/restantes, próxima parcela, juros a pagar, data de quitação, gráfico e tabela de parcelas
+- **Simulador completo de amortização**: monte um plano com valores únicos ou recorrentes (todo mês, 13º, FGTS a cada 2 anos…), reduzindo prazo ou parcela, e compare *hoje × com o plano* (quitação, juros, economia, gráficos e tabela ano a ano). O plano pode ser salvo
+- **Concretizar amortizações**: "✔ Realizei" registra a amortização e, depois, você informa o que o banco mostrou (saldo devedor, nova parcela, parcelas restantes) — a tabela passa a seguir os números reais
+- **Atualizar pelos dados do banco** a qualquer momento (inclui TR e correções) e ver quanto as amortizações já economizaram
+- **Consórcios**: parcela com taxa de administração, fundo de reserva, seguro e reajuste anual; parcelas pagas, falta pagar, contemplação e **simulador de lance** (inclusive embutido)
+- Parcelas lançadas automaticamente todo mês (valor calculado pela tabela) e **patrimônio líquido** (contas + investimentos + bens − dívidas)
+
+**Ícones**
+- Ícone por categoria (escolha no seletor) e por classe de investimento
+- Selo com cor e sigla dos principais bancos, detectado pelo nome da conta — ou envie uma imagem própria
+
 **Automação**
 - **Importação de extratos** OFX (quase todos os bancos) e CSV (Nubank conta e cartão, Inter, Itaú, C6…), com detecção automática de colunas, formato de número brasileiro e encoding
 - **Deduplicação**: importar o mesmo extrato duas vezes não duplica nada; lançamentos manuais/recorrentes parecidos aparecem como "possível duplicada"
