@@ -131,6 +131,7 @@ function loadState() {
   catch (e) { console.error(e); return defaultState(); }
 }
 let state = loadState();
+// (o cache de cotações é aplicado logo após a definição de applyQuoteCache)
 function persist() {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
   catch (e) { toast('Não foi possível salvar no navegador: ' + e.message); }
@@ -283,25 +284,29 @@ function runRecurring() {
 
 /* ---- investimentos ---- */
 function portfolio() {
-  const pos = new Map(state.investments.assets.map(a => [a.id, { asset: a, qty: 0, cost: 0, realized: 0, dividends: 0, invested: 0 }]));
+  const pos = new Map(state.investments.assets.map(a => [a.id, { asset: a, qty: 0, cost: 0, realized: 0, dividends: 0, invested: 0, firstDate: null, div12: 0 }]));
   const ops = [...state.investments.operations].sort((a, b) => a.date.localeCompare(b.date));
   for (const op of ops) {
     const p = pos.get(op.assetId); if (!p) continue;
     const qty = +op.qty || 0, price = +op.price || 0, fees = +op.fees || 0;
-    if (op.type === 'compra') { p.qty += qty; p.cost += qty * price + fees; p.invested += qty * price + fees; }
+    if (op.type === 'compra') { p.qty += qty; p.cost += qty * price + fees; p.invested += qty * price + fees; if (!p.firstDate) p.firstDate = op.date; }
     else if (op.type === 'venda') {
       const avg = p.qty ? p.cost / p.qty : 0;
       const q = Math.min(qty, p.qty);
       p.realized += q * price - fees - avg * q;
       p.cost -= avg * q; p.qty -= q;
-    } else if (op.type === 'provento') p.dividends += qty * price;
+    } else if (op.type === 'provento') { p.dividends += qty * price; if (op.date >= addMonths(currentMonth(), -12) + '-01') p.div12 += qty * price; }
   }
   const list = [...pos.values()].map(p => {
     const a = p.asset;
+    p.auto = !!indexRate(a);
+    p.market = +a.tdQty > 0 && +a.tdPrice > 0;
     const avg = p.qty > 1e-9 ? p.cost / p.qty : 0;
     const price = +a.currentPrice || avg;
     const manual = a.manualValue !== undefined && a.manualValue !== null && a.manualValue !== '';
-    const value = p.qty > 1e-9 ? (manual ? +a.manualValue : p.qty * price) : 0;
+    const auto = p.qty > 1e-9 ? indexedValue(a) : null;
+    const td = +a.tdQty > 0 && +a.tdPrice > 0 ? +a.tdQty * +a.tdPrice : null;
+    const value = p.qty > 1e-9 ? (td != null ? td : auto != null ? auto : manual ? +a.manualValue : p.qty * price) : 0;
     return { ...p, avg, price, value, result: value - p.cost, resultPct: p.cost ? (value - p.cost) / p.cost : 0 };
   });
   const totals = {
@@ -334,10 +339,71 @@ function findOrCreateAsset(ticker, cls) {
   return a;
 }
 
-async function updateQuotes() {
+/** Taxa anual (%) de um título indexado: % do CDI, prefixado ou IPCA + taxa. */
+function indexRate(a) {
+  const r = +a.idxRate;
+  if (!a.indexer || !(r > 0)) return null;
+  const mk = typeof market === 'undefined' ? {} : market;
+  const cdi = +state.settings.cdi || mk.cdi;
+  if (a.indexer === 'cdi') return cdi ? (cdi * r) / 100 : null;
+  if (a.indexer === 'pre') return r;
+  if (a.indexer === 'ipca') return mk.ipca12 != null ? ((1 + mk.ipca12 / 100) * (1 + r / 100) - 1) * 100 : null;
+  return null;
+}
+/** Valor bruto estimado: cada aporte rende pela taxa desde a data; resgates saem do saldo. */
+function indexedValue(a) {
+  const rate = indexRate(a);
+  if (rate == null) return null;
+  const today = new Date(todayISO() + 'T12:00:00').getTime();
+  const ops = state.investments.operations.filter(o => o.assetId === a.id && o.type !== 'provento');
+  let v = 0;
+  for (const o of ops) {
+    const years = Math.max(0, (today - new Date(o.date + 'T12:00:00').getTime()) / (365.25 * 864e5));
+    const amt = (+o.qty || 0) * (+o.price || 0);
+    v += (o.type === 'compra' ? 1 : -1) * amt * Math.pow(1 + rate / 100, years);
+  }
+  return Math.max(0, v);
+}
+setTimeout(() => { applyQuoteCache(); }, 0);
+const INDEXERS = { '': 'Manual (eu informo o valor)', cdi: '% do CDI', pre: 'Prefixado (% a.a.)', ipca: 'IPCA + taxa (% a.a.)' };
+
+/* ---------- cotações: cache local (não conflita com a sincronização) e atualização automática ---------- */
+const QUOTES_KEY = 'minhas-financas.quotes';
+let quoteCache = (() => { try { return JSON.parse(localStorage.getItem(QUOTES_KEY)) || {}; } catch { return {}; } })();
+function applyQuoteCache() {
+  for (const a of state.investments.assets) {
+    const q = quoteCache[a.ticker];
+    if (q && (!a.priceUpdatedAt || q.at > a.priceUpdatedAt)) { a.currentPrice = q.price; a.priceUpdatedAt = q.at; if (q.high52) { a.high52 = q.high52; a.low52 = q.low52; } }
+    const t = a.tdSymbol && quoteCache['TD:' + a.tdSymbol];
+    if (t && (!a.tdPriceAt || t.at > a.tdPriceAt)) { a.tdPrice = t.price; a.tdPriceAt = t.at; }
+  }
+}
+function isMarketHours() { const d = new Date(), h = d.getHours(), w = d.getDay(); return w >= 1 && w <= 5 && h >= 10 && h < 18; }
+let quotesBusy = false, quoteHintShown = false;
+async function autoQuotes(force = false) {
+  if (quotesBusy || !navigator.onLine) return;
+  const last = state.investments.quotesAt || 0;
+  const age = Date.now() - last;
+  const hasB3 = state.investments.assets.some(a => ['Ações', 'FIIs', 'ETFs', 'BDRs'].includes(a.class));
+  const hasCrypto = state.investments.assets.some(a => a.class === 'Cripto');
+  const hasTD = state.investments.assets.some(a => a.tdSymbol);
+  // B3: no pregão a cada 20 min; fora dele, uma vez ao abrir (fechamento). Cripto: 24h, a cada 20 min.
+  const due = force || age > 20 * 60e3 && (((hasB3 || hasTD) && (isMarketHours() || age > 6 * 3600e3)) || hasCrypto);
+  if (due) await updateQuotes({ silent: true });
+}
+function safeRender() {
+  const el = document.activeElement;
+  if ($('#modal').open || (el && ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName))) { ui.renderPending = true; return; }
+  render();
+}
+document.addEventListener('focusout', () => { if (ui.renderPending) setTimeout(() => { const el = document.activeElement; if (ui.renderPending && !(el && ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName)) && !$('#modal').open) { ui.renderPending = false; render(); } }, 300); });
+
+async function updateQuotes({ silent = false } = {}) {
   const assets = state.investments.assets.filter(a => ASSET_CLASSES[a.class]?.quote);
-  if (!assets.length) { toast('Nenhum ativo com cotação automática (Ações, FIIs, ETFs, BDRs, Cripto).'); return; }
-  toast('Atualizando cotações…');
+  const tds = state.investments.assets.filter(a => a.tdSymbol);
+  if (!assets.length && !tds.length) { if (!silent) toast('Nenhum ativo com cotação automática (Ações, FIIs, ETFs, BDRs, Cripto).'); return; }
+  if (!silent) toast('Atualizando cotações…');
+  quotesBusy = true;
   const token = state.settings.brapiToken?.trim();
   const ok = [], fail = [];
   const crypto = assets.filter(a => a.class === 'Cripto');
@@ -347,10 +413,32 @@ async function updateQuotes() {
     const r = await fetch(url);
     if (!r.ok) throw new Error(r.status);
     const j = await r.json();
-    const price = j?.results?.[0]?.regularMarketPrice;
+    const q0 = j?.results?.[0] || {}; const price = q0.regularMarketPrice;
     if (!price) throw new Error('sem preço');
     a.currentPrice = price; a.priceUpdatedAt = new Date().toISOString(); ok.push(a.ticker);
+    if (q0.fiftyTwoWeekHigh) { a.high52 = q0.fiftyTwoWeekHigh; a.low52 = q0.fiftyTwoWeekLow; }
+    quoteCache[a.ticker] = { price, at: a.priceUpdatedAt, high52: a.high52, low52: a.low52 };
   }).map((p, i) => p.catch(() => fail.push(b3[i].ticker)));
+  if (tds.length) {
+    // Preço unitário (PU) de mercado dos títulos do Tesouro. Aceita variações de nome de campo na resposta.
+    jobs.push((async () => {
+      try {
+        const syms = [...new Set(tds.map(a => a.tdSymbol.trim().toLowerCase()))].slice(0, 20);
+        const r = await fetch(`https://brapi.dev/api/v2/treasury/indicators?symbols=${syms.join(',')}` + (token ? `&token=${encodeURIComponent(token)}` : ''));
+        if (!r.ok) throw new Error(r.status);
+        const j = await r.json();
+        const items = [j.results, j.indicators, j.data, j.bonds, Array.isArray(j) ? j : null].find(Array.isArray) || [];
+        const num = x => (typeof x === 'number' ? x : parseFloat(String(x ?? '').replace(',', '.')));
+        const pick = it => ['sellUnitPrice', 'unitPriceSell', 'sellPrice', 'redemptionUnitPrice', 'redemptionPrice', 'puVenda', 'unitPrice', 'price', 'pu', 'buyUnitPrice', 'buyPrice']
+          .map(k => num(it[k] ?? it.prices?.[k] ?? it.price?.[k])).find(v => v > 0);
+        for (const a of tds) {
+          const it = items.find(x => String(x.symbol || x.code || x.id || '').toLowerCase() === a.tdSymbol.trim().toLowerCase());
+          const pu = it && pick(it);
+          if (pu) { a.tdPrice = pu; a.tdPriceAt = new Date().toISOString(); quoteCache['TD:' + a.tdSymbol] = { price: pu, at: a.tdPriceAt }; ok.push(a.ticker); } else fail.push(a.ticker);
+        }
+      } catch { tds.forEach(a => fail.push(a.ticker)); }
+    })());
+  }
   if (crypto.length) {
     jobs.push((async () => {
       const ids = crypto.map(a => a.quoteId || COINGECKO_IDS[a.ticker] || a.ticker.toLowerCase());
@@ -359,16 +447,20 @@ async function updateQuotes() {
         const j = await r.json();
         crypto.forEach((a, i) => {
           const p = j?.[ids[i]]?.brl;
-          if (p) { a.currentPrice = p; a.priceUpdatedAt = new Date().toISOString(); ok.push(a.ticker); } else fail.push(a.ticker);
+          if (p) { a.currentPrice = p; a.priceUpdatedAt = new Date().toISOString(); quoteCache[a.ticker] = { price: p, at: a.priceUpdatedAt }; ok.push(a.ticker); } else fail.push(a.ticker);
         });
       } catch { crypto.forEach(a => fail.push(a.ticker)); }
     })());
   }
   await Promise.all(jobs);
-  recordSnapshot(); save(); render();
+  quotesBusy = false;
+  // Preços ficam no cache local e no estado SEM marcar alteração: não disputam a sincronização com lançamentos do outro aparelho.
+  try { localStorage.setItem(QUOTES_KEY, JSON.stringify(quoteCache)); } catch { /* */ }
+  if (ok.length) { state.investments.quotesAt = Date.now(); recordSnapshot(); persist(); safeRender(); }
   let msg = `${ok.length} cotação(ões) atualizada(s).`;
   if (fail.length) msg += ` Falharam: ${fail.join(', ')}` + (token ? '' : ' — configure um token gratuito da brapi.dev em Configurações.');
-  toast(msg, 6000);
+  if (!silent) toast(msg, 6000);
+  else if (fail.length && !token && !quoteHintShown) { quoteHintShown = true; toast('Algumas cotações não atualizaram sozinhas: crie um token gratuito em brapi.dev e cole em Configurações.', 8000); }
 }
 
 /* ================================================================== charts */
@@ -694,11 +786,133 @@ function viewTransactions() {
     </div>`;
 }
 
+/* ---------- análise da carteira (sinais objetivos, sem previsão de mercado) ---------- */
+const TAX = { // regras gerais de IR na venda (pessoa física) — confirmar com a Receita/contador
+  'Ações': { rate: 0.15, exempt: 20000, note: 'ações: isento se as vendas de ações no mês somarem até R$ 20 mil' },
+  'FIIs': { rate: 0.20, note: 'FIIs: 20% sobre o lucro, sem isenção' },
+  'ETFs': { rate: 0.15, note: 'ETFs: 15% sobre o lucro, sem isenção' },
+  'BDRs': { rate: 0.15, note: 'BDRs: 15% sobre o lucro, sem isenção' },
+  'Cripto': { rate: 0.15, exempt: 35000, note: 'cripto: isento se as vendas no mês somarem até R$ 35 mil' },
+  'Exterior': { rate: 0.15, note: 'exterior: 15% na declaração anual' },
+  'Outros': { rate: 0.15, note: '' }, 'Renda Fixa': { rate: 0.15, note: 'renda fixa: IR regressivo retido na fonte' }, 'Tesouro Direto': { rate: 0.15, note: 'Tesouro: IR regressivo retido na fonte' },
+};
+const analysisCdi = () => +state.settings.cdi || market.cdi || 0;
+function monthSales(cls, ym = currentMonth()) {
+  return sum(state.investments.operations.filter(o => o.type === 'venda' && o.date.startsWith(ym) && state.investments.assets.find(a => a.id === o.assetId)?.class === cls), o => o.qty * o.price);
+}
+function assetSignals(p, total) {
+  const a = p.asset, out = [], cdi = analysisCdi();
+  const weight = total ? p.value / total : 0;
+  const t = p.firstDate ? (Date.now() - new Date(p.firstDate + 'T12:00:00').getTime()) / (365.25 * 864e5) : 0;
+  if (cdi && t >= 0.5 && p.cost > 0) {
+    const ret = (p.value + p.dividends + p.realized - p.cost) / p.cost;
+    const cdiRet = Math.pow(1 + cdi / 100, t) - 1;
+    const gap = (cdiRet - ret) * p.cost;
+    if (ret < cdiRet - 0.02) out.push({ lv: 'warn', k: 'cdi', t: `Rendeu ${pct(ret)} (com proventos) desde ${fmtDate(p.firstDate)}; o CDI rendeu ~${pct(cdiRet)} no período. Custo de oportunidade ≈ ${fmt(gap)}.` });
+    else if (ret > cdiRet + 0.02) out.push({ lv: 'good', k: 'cdi', t: `Rendeu ${pct(ret)} desde ${fmtDate(p.firstDate)}, acima do CDI (~${pct(cdiRet)}).` });
+  }
+  if (weight > 0.15 && !ASSET_CLASSES[a.class]?.manual) out.push({ lv: 'warn', k: 'conc', t: `Representa ${pct(weight)} da carteira: concentração alta em um único ativo.` });
+  if (+a.high52 > 0 && +a.low52 > 0 && p.price) {
+    const dd = 1 - p.price / a.high52, pos = (p.price - a.low52) / Math.max(0.01, a.high52 - a.low52);
+    if (dd > 0.2) out.push({ lv: 'info', k: '52', t: `Está ${pct(dd)} abaixo da máxima de 52 semanas (${fmt(a.high52)}). Queda pode ser oportunidade ou piora dos fundamentos — vale reavaliar a tese.` });
+    else if (pos > 0.9) out.push({ lv: 'info', k: '52', t: `Perto da máxima de 52 semanas (${fmt(a.high52)}). Se passou do peso-alvo, é um bom momento para rebalancear.` });
+  }
+  if (a.class === 'FIIs' && cdi && p.value > 0 && p.firstDate && t >= 1) {
+    const dy = p.div12 / p.value, cdiNet = (cdi * 0.85) / 100;
+    if (dy < cdiNet - 0.02) out.push({ lv: 'warn', k: 'dy', t: `Rendimento 12m de ${pct(dy)} (isento), abaixo do CDI líquido (~${pct(cdiNet)}).` });
+    else out.push({ lv: 'good', k: 'dy', t: `Rendimento 12m de ${pct(dy)} (isento) × CDI líquido ~${pct(cdiNet)}.` });
+  }
+  if (p.result < -1 && !ASSET_CLASSES[a.class]?.manual) out.push({ lv: 'info', k: 'loss', t: `Prejuízo não realizado de ${fmt(-p.result)}: se decidir vender, o prejuízo pode compensar IR de ganhos futuros na mesma categoria.` });
+  return out;
+}
+
+function viewAnalysis() {
+  const { list, totals } = portfolio();
+  const active = list.filter(p => p.qty > 1e-9);
+  const total = totals.value;
+  const tg = state.investments.targets || {};
+  const head = `<div class="page-head"><div><button class="btn small ghost" data-action="close-analysis">← Voltar</button>
+    <h1>Análise da carteira</h1><p>Sinais objetivos para você decidir o que manter, vender ou reforçar</p></div>
+    <div class="toolbar"><label class="field small">CDI % a.a.<input type="number" step="any" data-change="pa" data-field="cdi" value="${esc(state.settings.cdi || market.cdi || '')}" style="width:100px"></label>
+      <button class="btn" data-action="update-quotes">↻ Atualizar cotações</button></div></div>
+    <div class="card note">⚠️ <strong>Isto não é recomendação de investimento</strong> e não prevê o mercado: mostra fatos da sua carteira (desempenho × CDI, concentração, distância das máximas/mínimas, peso × meta e impostos) para apoiar a sua decisão.</div>`;
+  if (!active.length) return head + '<div class="card empty-state"><h2>Sem posições abertas</h2></div>';
+
+  // 1) rebalanceamento
+  const byClass = {}; for (const p of active) byClass[p.asset.class] = (byClass[p.asset.class] || 0) + p.value;
+  const classes = Object.keys(ASSET_CLASSES).filter(c => byClass[c] || +tg[c]);
+  const sumT = sum(classes, c => +tg[c] || 0);
+  const aporte = +ui.aporte || 0;
+  const deficits = classes.map(c => ({ c, d: Math.max(0, ((+tg[c] || 0) / 100) * (total + aporte) - (byClass[c] || 0)) }));
+  const defSum = sum(deficits, x => x.d);
+  const rebal = `<div class="card"><h2>⚖️ Rebalanceamento</h2><div class="sub">defina o % alvo de cada classe (soma: <strong class="${Math.abs(sumT - 100) < 0.01 ? 'pos' : 'neg'}">${String(sumT).replace('.', ',')}%</strong>)</div>
+    <div class="table-wrap"><table><thead><tr><th>Classe</th><th class="num">Atual</th><th class="num">Atual %</th><th class="num">Alvo %</th><th class="num">Para chegar no alvo</th>${aporte ? '<th class="num">No próximo aporte</th>' : ''}</tr></thead><tbody>
+    ${classes.map(c => { const cur = byClass[c] || 0, t = +tg[c] || 0, diff = (t / 100) * total - cur; const ap = aporte && defSum ? (deficits.find(x => x.c === c).d / defSum) * aporte : 0;
+      return `<tr><td>${ASSET_CLASSES[c].icon} ${esc(c)}</td><td class="num">${fmt(cur)}</td><td class="num">${pct(total ? cur / total : 0)}</td>
+        <td class="num"><input type="number" min="0" max="100" step="1" class="mini" data-change="pa" data-field="t:${esc(c)}" value="${t || ''}"></td>
+        <td class="num">${!sumT ? '—' : Math.abs(diff) < total * 0.01 ? '<span class="muted">ok</span>' : diff > 0 ? `<span class="pos">comprar ${fmt(diff)}</span>` : `<span class="neg">reduzir ${fmt(-diff)}</span>`}</td>
+        ${aporte ? `<td class="num">${ap ? fmt(ap) : '—'}</td>` : ''}</tr>`; }).join('')}
+    </tbody></table></div>
+    <div class="toolbar mt"><label class="field small">Rebalancear só com aporte novo de (R$)<input type="number" min="0" step="100" data-change="pa-aporte" value="${aporte || ''}" style="width:140px"></label>
+      <span class="small muted">rebalancear com aportes evita vender e pagar IR</span></div></div>`;
+
+  // 2) sinais por ativo
+  const rows = active.sort((a, b) => b.value - a.value).map(p => ({ p, sig: assetSignals(p, total) }));
+  const nWarn = sum(rows, r => r.sig.filter(x => x.lv === 'warn').length);
+  const signals = `<div class="card mt"><h2>🔎 Sinais por ativo</h2><div class="sub">${nWarn ? `${nWarn} ponto(s) de atenção` : 'nenhum ponto de atenção'} · atualize as cotações para os dados de 52 semanas</div>
+    ${rows.map(({ p, sig }) => `<div class="sig-row"><div class="sig-head"><strong>${esc(p.asset.ticker)}</strong> <span class="pill">${ASSET_CLASSES[p.asset.class]?.icon || ''} ${esc(p.asset.class)}</span>
+      <span class="muted small">${fmt(p.value)} · ${pct(total ? p.value / total : 0)} · <span class="${p.result >= 0 ? 'pos' : 'neg'}">${pct(p.resultPct)}</span></span>
+      ${!ASSET_CLASSES[p.asset.class]?.manual ? `<button class="btn small" data-action="trade-pick" data-id="${p.asset.id}">Simular venda/troca</button>` : ''}</div>
+      ${sig.length ? `<ul class="sig">${sig.map(x => `<li class="${x.lv}">${x.lv === 'warn' ? '⚠️' : x.lv === 'good' ? '✅' : 'ℹ️'} ${x.t}</li>`).join('')}</ul>` : '<p class="small muted">Sem sinais relevantes.</p>'}</div>`).join('')}</div>`;
+
+  // 3) simulador de troca
+  const tr = ui.trade || {};
+  const sellable = active.filter(p => !ASSET_CLASSES[p.asset.class]?.manual);
+  const sp = sellable.find(p => p.asset.id === tr.id) || sellable[0];
+  let trade = '';
+  if (sp) {
+    const qty = Math.min(+tr.qty || sp.qty, sp.qty), price = +tr.price || sp.price;
+    const gross = qty * price, gain = qty * (price - sp.avg);
+    const rule = TAX[sp.asset.class] || TAX['Outros'];
+    const salesMonth = monthSales(sp.asset.class) + gross;
+    const exempt = rule.exempt && salesMonth <= rule.exempt;
+    const tax = gain > 0 && !exempt ? gain * rule.rate : 0;
+    const net = gross - tax;
+    const dest = tr.dest || '';
+    const after = { ...byClass }; after[sp.asset.class] = (after[sp.asset.class] || 0) - gross; if (dest) after[dest] = (after[dest] || 0) + net;
+    const totAfter = total - gross + (dest ? net : 0);
+    const opt = (v, l, sel) => `<option value="${esc(v)}" ${sel ? 'selected' : ''}>${esc(l)}</option>`;
+    trade = `<div class="card mt" id="trade"><h2>🔁 Simular venda / troca</h2><div class="sub">veja o imposto e como fica a carteira antes de decidir</div>
+      <div class="toolbar">
+        <label class="field small">Vender<select data-change="tr" data-field="id">${sellable.map(p => opt(p.asset.id, `${p.asset.ticker} (${fmtNum(p.qty)})`, p === sp)).join('')}</select></label>
+        <label class="field small">Quantidade<input type="number" step="any" min="0" data-change="tr" data-field="qty" value="${qty}" style="width:110px"></label>
+        <label class="field small">Preço de venda<input type="number" step="any" min="0" data-change="tr" data-field="price" value="${round2(price)}" style="width:110px"></label>
+        <label class="field small">Colocar o valor em<select data-change="tr" data-field="dest">${opt('', 'manter em caixa', !dest)}${Object.keys(ASSET_CLASSES).map(c => opt(c, c, dest === c)).join('')}</select></label>
+      </div>
+      <div class="debt-nums">
+        <div><span class="label">Valor da venda</span><strong>${fmt(gross)}</strong></div>
+        <div><span class="label">${gain >= 0 ? 'Lucro' : 'Prejuízo'} (vs. preço médio ${fmt(sp.avg)})</span><strong class="${gain >= 0 ? 'pos' : 'neg'}">${fmt(gain)}</strong></div>
+        <div><span class="label">IR estimado</span><strong class="${tax ? 'neg' : ''}">${fmt(tax)}</strong><span class="muted small">${exempt && gain > 0 ? 'isento (limite mensal)' : gain <= 0 ? 'prejuízo: guarde para compensar' : `${pct(rule.rate)} via DARF até o fim do mês seguinte`}</span></div>
+        <div><span class="label">Fica para reinvestir</span><strong>${fmt(net)}</strong></div>
+      </div>
+      ${rule.exempt && gain > 0 && !exempt ? `<p class="small">💡 As vendas de ${esc(sp.asset.class)} neste mês somariam ${fmt(salesMonth)}. Vendendo até ${fmt(Math.max(0, rule.exempt - monthSales(sp.asset.class)))} neste mês (e o resto no próximo), o lucro fica <strong>isento</strong>.</p>` : ''}
+      <p class="small muted">${esc(rule.note)}. Prejuízos de meses anteriores podem reduzir o imposto. Confirme com a Receita ou um contador.</p>
+      <h3 class="small-title">Carteira depois da troca</h3>
+      <div class="table-wrap"><table><thead><tr><th>Classe</th><th class="num">Hoje</th><th class="num">Depois</th>${sumT ? '<th class="num">Alvo</th>' : ''}</tr></thead><tbody>
+        ${Object.keys(ASSET_CLASSES).filter(c => byClass[c] || after[c] > 0.5).map(c => `<tr><td>${ASSET_CLASSES[c].icon} ${esc(c)}</td><td class="num">${pct(total ? (byClass[c] || 0) / total : 0)}</td><td class="num"><strong>${pct(totAfter ? Math.max(0, after[c] || 0) / totAfter : 0)}</strong></td>${sumT ? `<td class="num">${+tg[c] ? (+tg[c]) + '%' : '—'}</td>` : ''}</tr>`).join('')}
+      </tbody></table></div>
+      <div class="toolbar mt"><button class="btn primary" data-action="trade-register">Registrar esta venda</button><span class="small muted">cria a operação de venda na carteira (não executa nada na corretora)</span></div></div>`;
+  }
+  return head + `<div class="mt">${rebal}</div>` + signals + trade;
+}
+
 function viewInvestments() {
+  if (ui.analysis) return viewAnalysis();
   const { list, totals } = portfolio();
   const active = list.filter(p => p.qty > 1e-9).sort((a, b) => b.value - a.value);
-  const head = `<div class="page-head"><div><h1>Investimentos</h1><p>Carteira consolidada, alocação e rentabilidade</p></div>
-    <div class="toolbar"><button class="btn" data-action="update-quotes">↻ Atualizar cotações</button><button class="btn primary" data-action="add-op">+ Nova operação</button></div></div>`;
+  const qa = state.investments.quotesAt;
+  const head = `<div class="page-head"><div><h1>Investimentos</h1><p>Carteira consolidada, alocação e rentabilidade · <span class="small ${qa ? 'pos' : 'muted'}">${qa ? '⚡ cotações automáticas, atualizadas ' + new Date(qa).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }) : 'cotações automáticas ativadas'}</span>${market.cdi ? ` · <span class="small muted">CDI ${fmtPctNum(market.cdi)}${market.ipca12 != null ? ' · IPCA 12m ' + fmtPctNum(market.ipca12) : ''}</span>` : ''}</p></div>
+    <div class="toolbar"><button class="btn" data-action="open-analysis">🔎 Análise da carteira</button><button class="btn" data-action="update-quotes">↻ Atualizar cotações</button><button class="btn primary" data-action="add-op">+ Nova operação</button></div></div>`;
   if (!state.investments.operations.length) {
     return head + `<div class="card empty-state"><h2>Nenhum investimento cadastrado</h2>
       <p>Registre compras, vendas e proventos, ou importe o CSV de negociações da Área do Investidor da B3 / da sua corretora. As cotações de ações, FIIs, ETFs, BDRs e cripto são atualizadas automaticamente.</p>
@@ -728,6 +942,7 @@ function viewInvestments() {
   const rows = active.map(p => {
     const a = p.asset; const manual = ASSET_CLASSES[a.class]?.manual;
     const upd = a.priceUpdatedAt ? `atualizado ${new Date(a.priceUpdatedAt).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' })}` : 'preço manual';
+    const idxLabel = p.market ? `<br><span class="small pos">mercado · PU ${fmt(a.tdPrice)}</span>` : p.auto ? `<br><span class="small pos">auto · ${a.indexer === 'cdi' ? a.idxRate + '% CDI' : a.indexer === 'pre' ? 'pré ' + fmtRate(a.idxRate) : 'IPCA+' + fmtRate(a.idxRate)}</span>` : (manual ? '<br><span class="small warn">manual</span>' : '');
     return `<tr>
       <td><strong>${esc(a.ticker)}</strong></td>
       <td><span class="pill">${ASSET_CLASSES[a.class]?.icon || ''} ${esc(a.class)}</span></td>
@@ -735,7 +950,7 @@ function viewInvestments() {
       <td class="num">${manual ? '—' : fmt(p.avg)}</td>
       <td class="num" title="${esc(upd)}">${manual ? '—' : fmt(p.price)}</td>
       <td class="num">${fmt(p.cost)}</td>
-      <td class="num"><strong>${fmt(p.value)}</strong></td>
+      <td class="num"><strong>${fmt(p.value)}</strong>${idxLabel}</td>
       <td class="num ${p.result >= 0 ? 'pos' : 'neg'}">${fmt(p.result)}<br><span class="small">${pct(p.resultPct)}</span></td>
       <td class="num">${pct(totals.value ? p.value / totals.value : 0)}</td>
       <td><div class="row-actions">
@@ -1123,13 +1338,15 @@ let market = (() => { try { return JSON.parse(localStorage.getItem(MARKET_KEY)) 
 async function fetchMarket(force = false) {
   if (!force && market.at && Date.now() - market.at < 12 * 3600e3) return;
   try {
-    const r = await fetch('https://api.bcb.gov.br/dados/serie/bcdata.sgs.4389/dados/ultimos/1?formato=json');
-    const j = await r.json();
-    const v = parseFloat(String(j[0].valor).replace(',', '.'));
-    if (v > 0) {
-      market = { cdi: v, cdiDate: j[0].data, at: Date.now() };
+    const get = async code => { const r = await fetch(`https://api.bcb.gov.br/dados/serie/bcdata.sgs.${code}/dados/ultimos/1?formato=json`); const j = await r.json(); return { v: parseFloat(String(j[0].valor).replace(',', '.')), d: j[0].data }; };
+    const [cdi, ipca] = await Promise.allSettled([get(4389), get(13522)]);
+    const next = { ...market, at: Date.now() };
+    if (cdi.status === 'fulfilled' && cdi.value.v > 0) { next.cdi = cdi.value.v; next.cdiDate = cdi.value.d; }
+    if (ipca.status === 'fulfilled' && ipca.value.v > -50) { next.ipca12 = ipca.value.v; next.ipcaDate = ipca.value.d; }
+    if (next.cdi || next.ipca12 != null) {
+      market = next;
       try { localStorage.setItem(MARKET_KEY, JSON.stringify(market)); } catch { /* */ }
-      if (ui.sim || ui.cons) render();
+      safeRender();
     }
   } catch { /* sem internet ou bloqueado: usa o valor manual */ }
 }
@@ -1601,6 +1818,8 @@ function opForm(ticker = '') {
     <label data-f="qty">Quantidade<input type="number" step="any" name="qty" value="1"></label>
     <label data-f="price"><span>Preço unitário (R$)</span><input type="number" step="any" name="price" required></label>
     <label data-f="fees">Taxas / corretagem (R$)<input type="number" step="any" name="fees" value="0"></label>
+    <label data-f="idx">Rende<select name="indexer">${Object.entries(INDEXERS).map(([k, l]) => `<option value="${k}" ${k === 'cdi' ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+    <label data-f="idx">Taxa (110 = 110% CDI; 6 = IPCA+6%)<input type="number" step="any" name="idxRate" placeholder="100"></label>
     <label class="check full"><input type="checkbox" name="createTx"> Lançar também como transação na conta</label>
     <label class="full" data-f="acc">Conta<select name="accountId">${accountOptions(state.accounts[0]?.id)}</select></label>
   </div>`;
@@ -1616,14 +1835,17 @@ function wireOpForm(dlg) {
     f.querySelector('[data-f=qty]').style.display = manual || prov ? 'none' : '';
     f.querySelector('[data-f=price] span').textContent = manual || prov ? 'Valor total (R$)' : 'Preço unitário (R$)';
     f.querySelector('[data-f=acc]').style.display = f.createTx.checked ? '' : 'none';
+    f.querySelectorAll('[data-f=idx]').forEach(x => { x.style.display = manual && !existing ? '' : 'none'; });
     f.cls.disabled = !!existing;
   };
   ['input', 'change'].forEach(ev => f.addEventListener(ev, sync));
   sync();
 }
 function saveOp(d) {
+  const isNew = !state.investments.assets.some(x => x.ticker === d.ticker.trim().toUpperCase());
   const a = findOrCreateAsset(d.ticker, d.cls);
   const manual = ASSET_CLASSES[a.class]?.manual;
+  if (isNew && manual && d.indexer && +d.idxRate > 0) { a.indexer = d.indexer; a.idxRate = +d.idxRate; }
   let qty = +d.qty || 0, price = +d.price || 0;
   if (manual) { qty = price; price = 1; }        // renda fixa: quantidade = R$ aplicado, preço unitário 1
   else if (d.type === 'provento') { qty = 1; }
@@ -1752,11 +1974,12 @@ function loadDemo() {
   const inv = s.investments;
   const asset = (ticker, cls, currentPrice, extra = {}) => { const a = { id: uid(), ticker, class: cls, currentPrice, manualValue: null, quoteId: '', ...extra }; inv.assets.push(a); return a; };
   const op = (a, months, type, qty, price) => inv.operations.push({ id: uid(), assetId: a.id, date: `${addMonths(currentMonth(), months)}-06`, type, qty, price, fees: 0 });
-  const petr = asset('PETR4', 'Ações', 38.42), itub = asset('ITUB4', 'Ações', 36.1), vale = asset('VALE3', 'Ações', 61.3);
-  const mxrf = asset('MXRF11', 'FIIs', 9.72), hglg = asset('HGLG11', 'FIIs', 158.4), ivvb = asset('IVVB11', 'ETFs', 352.1);
-  const selic = asset('TESOURO SELIC 2029', 'Tesouro Direto', null, { manualValue: 15840 });
-  const cdb = asset('CDB BANCO INTER 110% CDI', 'Renda Fixa', null, { manualValue: 10920 });
+  const petr = asset('PETR4', 'Ações', 38.42, { high52: 42.1, low52: 31.5 }), itub = asset('ITUB4', 'Ações', 36.1, { high52: 37.2, low52: 29.8 }), vale = asset('VALE3', 'Ações', 61.3, { high52: 79.9, low52: 55.2 });
+  const mxrf = asset('MXRF11', 'FIIs', 9.72, { high52: 10.4, low52: 9.3 }), hglg = asset('HGLG11', 'FIIs', 158.4, { high52: 171, low52: 150 }), ivvb = asset('IVVB11', 'ETFs', 352.1, { high52: 360, low52: 290 });
+  const selic = asset('TESOURO SELIC 2029', 'Tesouro Direto', null, { indexer: 'cdi', idxRate: 100, manualValue: 15840 });
+  const cdb = asset('CDB BANCO INTER 110% CDI', 'Renda Fixa', null, { indexer: 'cdi', idxRate: 110, manualValue: 10920 });
   const btc = asset('BTC', 'Cripto', 512000, { quoteId: 'bitcoin' });
+  inv.targets = { 'Renda Fixa': 20, 'Tesouro Direto': 20, 'Ações': 25, 'FIIs': 15, 'ETFs': 10, 'Cripto': 10 };
   op(petr, -11, 'compra', 100, 34.1); op(petr, -5, 'compra', 50, 36.8); op(itub, -9, 'compra', 200, 31.2); op(vale, -7, 'compra', 60, 66.5);
   op(mxrf, -10, 'compra', 600, 10.2); op(mxrf, -3, 'compra', 300, 9.6); op(hglg, -8, 'compra', 25, 162); op(ivvb, -6, 'compra', 15, 318);
   op(selic, -12, 'compra', 10000, 1); op(selic, -4, 'compra', 5000, 1); op(cdb, -9, 'compra', 10000, 1);
@@ -1775,12 +1998,13 @@ function loadDemo() {
   inv.history[currentMonth()] = round2(total);
   save(); render();
   toast('Dados de exemplo carregados.');
+  autoQuotes(true);
 }
 function suggestTagWith(rules, desc, amount) { const old = state.rules; state.rules = rules; const r = suggestTag(desc, amount); state.rules = old; return r; }
 
 /* ================================================================ actions */
 const actions = {
-  nav: el => { if ($('#modal').open) $('#modal').close(); ui.sim = null; ui.cons = null; ui.view = el.dataset.view; render(); window.scrollTo(0, 0); },
+  nav: el => { if ($('#modal').open) $('#modal').close(); ui.sim = null; ui.cons = null; ui.analysis = false; ui.view = el.dataset.view; render(); window.scrollTo(0, 0); },
   'toggle-hide': () => { prefs.hide = !prefs.hide; savePrefs(); render(); },
   'hide-onboarding': () => { prefs.hideOnboarding = true; savePrefs(); render(); },
   'onboarding-go': el => { if (el.dataset.go === 'budgets') return actions['edit-budgets'](); ui.view = el.dataset.go; render(); window.scrollTo(0, 0); },
@@ -1899,12 +2123,21 @@ const actions = {
     openModal(`Editar ${a.ticker}`, `<div class="form-grid">
       <label>Ticker / nome<input type="text" name="ticker" required value="${esc(a.ticker)}"></label>
       <label>Classe<select name="cls">${Object.keys(ASSET_CLASSES).map(c => `<option ${c === a.class ? 'selected' : ''}>${c}</option>`).join('')}</select></label>
-      ${manual ? `<label class="full">Valor atual total (R$) — veja no app do banco/corretora<input type="number" step="any" name="manualValue" value="${a.manualValue ?? ''}"></label>` :
+      ${manual ? `<label>Atualização do valor<select name="indexer">${Object.entries(INDEXERS).map(([k, l]) => `<option value="${k}" ${(a.indexer || '') === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+        <label>Taxa (ex.: 110 p/ 110% CDI, 6 p/ IPCA+6%)<input type="number" step="any" name="idxRate" value="${a.idxRate ?? ''}"></label>
+        <label class="full">Valor atual total (R$) — só se for manual<input type="number" step="any" name="manualValue" value="${a.manualValue ?? ''}"></label>
+        <p class="full muted small">Com indexador, o valor é atualizado sozinho (estimativa bruta, antes do IR) usando CDI/IPCA do Banco Central.</p>
+        ${a.class === 'Tesouro Direto' ? `<div class="field full"><strong class="small" style="color:var(--text)">Preço de mercado real (marcação a mercado):</strong></div>
+        <label>Código do título<input type="text" name="tdSymbol" value="${esc(a.tdSymbol || '')}" placeholder="tesouro-ipca-15052035"></label>
+        <label>Quantidade de títulos (ex.: 2,35)<input type="number" step="any" name="tdQty" value="${a.tdQty ?? ''}"></label>
+        <p class="full muted small">Com o código e a quantidade (veja no extrato da corretora), o valor usa o preço unitário do dia do Tesouro, buscado automaticamente — inclui a oscilação do IPCA+ e do prefixado. Precisa do token da brapi.dev.${a.tdPriceAt ? ` Último PU: ${fmt(a.tdPrice)} em ${new Date(a.tdPriceAt).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' })}.` : ''}</p>` : ''}` :
         `<label>Preço atual (R$)<input type="number" step="any" name="currentPrice" value="${a.currentPrice ?? ''}"></label>
          <label>ID CoinGecko (cripto)<input type="text" name="quoteId" value="${esc(a.quoteId || '')}" placeholder="bitcoin"></label>`}
     </div>`, d => {
       a.ticker = d.ticker.trim().toUpperCase(); a.class = d.cls;
       if ('manualValue' in d) a.manualValue = d.manualValue === '' ? null : +d.manualValue;
+      if ('indexer' in d) { a.indexer = d.indexer; a.idxRate = d.idxRate === '' ? '' : +d.idxRate; }
+      if ('tdSymbol' in d) { const sym = d.tdSymbol.trim().toLowerCase(); if (sym !== (a.tdSymbol || '')) { a.tdPrice = null; a.tdPriceAt = null; } a.tdSymbol = sym; a.tdQty = d.tdQty === '' ? '' : +d.tdQty; if (sym) setTimeout(() => autoQuotes(true), 100); }
       if ('currentPrice' in d) { a.currentPrice = d.currentPrice === '' ? null : +d.currentPrice; a.priceUpdatedAt = null; }
       if ('quoteId' in d) a.quoteId = d.quoteId.trim();
       recordSnapshot();
@@ -1937,6 +2170,18 @@ const actions = {
   'modal-cancel': () => { ui.pendingSync = null; $('#modal').close(); },
   'clear-logo': () => {},
   'open-sim': el => { const d = state.debts.find(x => x.id === el.dataset.id); ui.cons = null; ui.sim = { debtId: d.id, items: JSON.parse(JSON.stringify(d.plan || [])) }; ui.view = 'debts'; render(); window.scrollTo(0, 0); fetchMarket(); },
+  'open-analysis': () => { ui.analysis = true; ui.view = 'investments'; render(); window.scrollTo(0, 0); fetchMarket(); },
+  'close-analysis': () => { ui.analysis = false; render(); window.scrollTo(0, 0); },
+  'trade-pick': el => { ui.trade = { id: el.dataset.id }; render(); $('#trade')?.scrollIntoView({ behavior: 'smooth' }); },
+  'trade-register': () => {
+    const { list } = portfolio(); const tr = ui.trade || {};
+    const sp = list.find(p => p.asset.id === tr.id && p.qty > 1e-9) || list.find(p => p.qty > 1e-9 && !ASSET_CLASSES[p.asset.class]?.manual);
+    if (!sp) return;
+    const qty = Math.min(+tr.qty || sp.qty, sp.qty), price = +tr.price || sp.price;
+    if (!confirm(`Registrar venda de ${fmtNum(qty)} ${sp.asset.ticker} a ${fmt(price)}?`)) return;
+    state.investments.operations.push({ id: uid(), assetId: sp.asset.id, date: todayISO(), type: 'venda', qty, price, fees: 0 });
+    recordSnapshot(); save(); ui.trade = null; render(); toast('Venda registrada na carteira.');
+  },
   'open-cons': el => { ui.sim = null; ui.cons = el.dataset.id; ui.view = 'debts'; render(); window.scrollTo(0, 0); fetchMarket(); },
   'close-cons': () => { ui.cons = null; render(); window.scrollTo(0, 0); },
   'market-refresh': () => { fetchMarket(true).then(() => toast(market.cdi ? `CDI atualizado: ${fmtPctNum(market.cdi)} a.a.` : 'Não consegui buscar o CDI agora; informe manualmente.')); },
@@ -2146,6 +2391,14 @@ document.addEventListener('change', e => {
     d.strategy = { ...(d.strategy || {}), [el.dataset.field]: el.type === 'checkbox' ? el.checked : el.value };
     save(); render();
   }
+  else if (k === 'pa') {
+    const f = el.dataset.field;
+    if (f === 'cdi') state.settings.cdi = el.value;
+    else { const c = f.slice(2); state.investments.targets = { ...(state.investments.targets || {}), [c]: el.value === '' ? 0 : +el.value }; }
+    save(); render();
+  }
+  else if (k === 'pa-aporte') { ui.aporte = +el.value || 0; render(); }
+  else if (k === 'tr') { ui.trade = { ...(ui.trade || {}), [el.dataset.field]: el.value }; if (el.dataset.field === 'id') { ui.trade.qty = ''; ui.trade.price = ''; } render(); $('#trade')?.scrollIntoView(); }
   else if (k === 'filter-month') { ui.filters.month = el.value; render(); }
   else if (k === 'filter-tag') { ui.filters.tag = el.value; render(); }
   else if (k === 'filter-account') { ui.filters.account = el.value; render(); }
@@ -2181,7 +2434,7 @@ document.addEventListener('input', e => {
 /* ================================================================== boot */
 Sync.init({
   getState: () => state,
-  applyRemote: data => { state = normalizeState(data); persist(); render(); },
+  applyRemote: data => { state = normalizeState(data); applyQuoteCache(); persist(); safeRender(); },
   onStatus: renderSyncStatus,
 });
 render();
@@ -2190,4 +2443,9 @@ render();
   if (Sync.enabled()) await Sync.syncNow();
   const generated = runRecurring();
   if (generated) { render(); toast(`${generated} lançamento(s) recorrente(s) gerado(s) automaticamente.`); }
+  // Atualizações automáticas: indicadores do BC e cotações ao abrir, a cada 5 min (respeitando o intervalo) e ao voltar ao app
+  await fetchMarket();
+  await autoQuotes();
+  setInterval(() => { if (document.visibilityState === 'visible') { autoQuotes(); fetchMarket(); } }, 5 * 60e3);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { autoQuotes(); fetchMarket(); } });
 })();

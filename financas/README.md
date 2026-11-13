@@ -26,6 +26,21 @@ Roda 100% no navegador, sem servidor e sem instalação: **abra o `index.html`**
 - **Cotações automáticas**: B3 via [brapi.dev](https://brapi.dev) (token gratuito em Configurações) e cripto via CoinGecko
 - Renda fixa/Tesouro: informe o valor atual de vez em quando (✎)
 
+**Atualização automática (sem clicar em nada)**
+- Cotações de ações, FIIs, ETFs, BDRs (brapi.dev) e cripto (CoinGecko) ao abrir o app, a cada 20 min no pregão e ao voltar para ele
+- **Tesouro Direto pelo preço de mercado** (PU do dia × quantidade de títulos) via brapi.dev
+- **Renda fixa e Tesouro pelo indexador** (% do CDI, prefixado ou IPCA+), com CDI e IPCA 12 meses buscados no Banco Central
+- Preços ficam num cache local e não disputam a sincronização com lançamentos feitos em outro aparelho
+
+**Análise da carteira** (não é recomendação: mostra fatos para apoiar a decisão)
+- Rebalanceamento por % alvo de cada classe, inclusive só com aportes (sem vender)
+- Sinais por ativo: rendimento × CDI no período, concentração, distância das máximas/mínimas de 52 semanas, dividend yield de FIIs × CDI líquido, prejuízos que compensam IR
+- Simulador de venda/troca com IR estimado (isenção de R$ 20 mil em ações, R$ 35 mil em cripto, 20% em FIIs…) e carteira resultante
+
+**Estratégias**
+- Financiamento: amortizar × investir, reserva de emergência, meta de quitação (quanto amortizar por mês), FGTS a cada 24 meses e comparação automática das estratégias
+- Consórcio: chance por sorteio, análise dos lances vencedores, lance recomendado, poder de lance e plano para chegar lá
+
 **Financiamentos e consórcios**
 - Financiamento imobiliário **SAC ou Price**: saldo devedor, parcelas pagas/restantes, próxima parcela, juros a pagar, data de quitação, gráfico e tabela de parcelas
 - **Simulador completo de amortização**: monte um plano com valores únicos ou recorrentes (todo mês, 13º, FGTS a cada 2 anos…), reduzindo prazo ou parcela, e compare *hoje × com o plano* (quitação, juros, economia, gráficos e tabela ano a ano). O plano pode ser salvo
