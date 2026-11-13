@@ -103,22 +103,28 @@ function defaultState() {
     investments: { assets: [], operations: [], history: {} },
   };
 }
+function normalizeState(s) {
+  const d = defaultState();
+  const merged = { ...d, ...s, settings: { ...d.settings, ...s.settings }, investments: { ...d.investments, ...s.investments }, budgets: s.budgets || {}, meta: s.meta || {} };
+  for (const t of merged.tags) if (t.group === undefined) t.group = DEFAULT_TAGS.find(x => x.name === t.name)?.group || '';
+  return merged;
+}
 function loadState() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return defaultState();
-    const s = JSON.parse(raw);
-    const d = defaultState();
-    const merged = { ...d, ...s, settings: { ...d.settings, ...s.settings }, investments: { ...d.investments, ...s.investments }, budgets: s.budgets || {} };
-    for (const t of merged.tags) if (t.group === undefined) t.group = DEFAULT_TAGS.find(x => x.name === t.name)?.group || '';
-    return merged;
-  } catch (e) { console.error(e); return defaultState(); }
+  try { const raw = localStorage.getItem(STORAGE_KEY); return raw ? normalizeState(JSON.parse(raw)) : defaultState(); }
+  catch (e) { console.error(e); return defaultState(); }
 }
 let state = loadState();
-function save() {
+function persist() {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
   catch (e) { toast('Não foi possível salvar no navegador: ' + e.message); }
 }
+/** Grava uma alteração feita pelo usuário e agenda o envio para a nuvem (se a sincronização estiver ativa). */
+function save() {
+  state.meta = { ...(state.meta || {}), updatedAt: Date.now() };
+  persist();
+  Sync.schedulePush();
+}
+const hasData = st => !!(st.transactions.length || st.investments.operations.length);
 
 const ui = {
   view: 'overview',
@@ -728,6 +734,48 @@ function viewImport() {
     </div>${preview}${invPreview}`;
 }
 
+function syncDetail() {
+  const st = Sync.status(); const i = Sync.info();
+  const last = i.lastSyncAt ? new Date(i.lastSyncAt).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' }) : 'nunca';
+  const base = { ok: `✔ Sincronizado · última sincronização ${last}`, pending: 'Alterações pendentes — enviando em instantes…', syncing: 'Sincronizando…', error: `⚠ ${st.msg}`, off: 'Desligada' }[st.state];
+  return base + (st.state === 'ok' && st.msg ? ` · ${st.msg}` : '');
+}
+function renderSyncStatus(st) {
+  const chip = $('#sync-status');
+  if (chip) {
+    chip.hidden = st.state === 'off';
+    chip.className = 'sync-chip ' + st.state;
+    chip.textContent = { ok: '☁ Sincronizado', pending: '☁ Salvando…', syncing: '☁ Sincronizando…', error: '⚠ Sem sincronizar', off: '' }[st.state];
+    chip.title = syncDetail();
+  }
+  const d = $('#sync-detail'); if (d) { d.textContent = syncDetail(); d.className = st.state === 'error' ? 'neg' : ''; }
+  if (st.state === 'ok' && st.msg) toast(st.msg, 9000);
+}
+function syncCard() {
+  const intro = `<h2>Sincronização entre aparelhos</h2><div class="sub">Os mesmos dados no computador e no celular. Tudo é criptografado com a sua senha <strong>antes</strong> de sair do aparelho e guardado num Gist secreto da sua conta do GitHub — nem o GitHub consegue ler.</div>`;
+  if (!Sync.enabled()) {
+    return `<div class="card">${intro}
+      <ol class="small how-to">
+        <li>Crie um token em <a href="https://github.com/settings/tokens/new?scopes=gist&description=Minhas%20Finan%C3%A7as" target="_blank" rel="noopener">github.com/settings/tokens/new</a> marcando <strong>somente a permissão "gist"</strong>. Em <em>Expiration</em>, escolha <em>No expiration</em> (ou renove quando vencer).</li>
+        <li>Cole o token abaixo e crie uma <strong>senha de sincronização</strong>.</li>
+        <li>Nos outros aparelhos, use <strong>o mesmo token e a mesma senha</strong>.</li>
+      </ol>
+      <div class="form-grid">
+        <label class="full">Token do GitHub<input type="password" id="sync-token" placeholder="ghp_…" autocomplete="off"></label>
+        <label class="full">Senha de sincronização<input type="password" id="sync-pass" placeholder="mínimo 8 caracteres" autocomplete="new-password"></label>
+      </div>
+      <div class="toolbar mt"><button class="btn primary" data-action="sync-connect">Conectar</button></div>
+      <p class="muted small">⚠ Guarde a senha: sem ela os dados da nuvem não podem ser abertos (os de cada aparelho continuam lá). Token e senha ficam salvos só neste aparelho.</p></div>`;
+  }
+  const i = Sync.info();
+  return `<div class="card">${intro}
+    <p id="sync-detail" class="${Sync.status().state === 'error' ? 'neg' : ''}">${esc(syncDetail())}</p>
+    <div class="toolbar"><button class="btn" data-action="sync-now">↻ Sincronizar agora</button>
+      <a class="btn" href="https://gist.github.com/${esc(i.gistId)}" target="_blank" rel="noopener">Ver Gist</a>
+      <button class="btn danger" data-action="sync-disconnect">Desconectar este aparelho</button></div>
+    <p class="muted small">Para conectar outro aparelho: abra o app nele, vá em Configurações › Sincronização e use o mesmo token e a mesma senha.</p></div>`;
+}
+
 function viewSettings() {
   const accTypes = { corrente: 'Conta corrente / poupança', cartao: 'Cartão de crédito', corretora: 'Corretora' };
   return `<div class="page-head"><div><h1>Configurações</h1><p>Contas, tags, regras de categorização, lançamentos recorrentes e backup</p></div></div>
@@ -739,6 +787,7 @@ function viewSettings() {
       </div>
       <p class="muted small">Sem token, a brapi só cota alguns ativos de teste. Crie um token gratuito em brapi.dev. Cripto usa a CoinGecko (sem token).</p>
     </div>
+    ${syncCard()}
     <div class="card"><div class="card-head"><h2>Contas</h2><button class="btn small" data-action="add-account">+ Conta</button></div>
       ${state.accounts.map(a => `<div class="list-row">${avatar(a)}<span class="grow"><strong>${esc(a.name)}</strong><br><span class="muted small">${accTypes[a.type]} · saldo inicial ${fmt(a.initialBalance)}${a.limit ? ' · limite ' + fmt(a.limit) : ''}</span></span>
         <button class="icon-btn" data-action="edit-account" data-id="${a.id}">✎</button><button class="icon-btn" data-action="del-account" data-id="${a.id}">✕</button></div>`).join('')}
@@ -761,6 +810,7 @@ function viewSettings() {
       <div class="toolbar mt"><button class="btn" data-action="export">⬇ Exportar JSON</button><button class="btn" data-action="pick-file" data-input-id="file-backup">⬆ Restaurar JSON</button>
         <input type="file" id="file-backup" accept=".json" hidden></div>
       <div class="toolbar"><button class="btn" data-action="load-demo">Carregar dados de exemplo</button><button class="btn danger" data-action="reset">Apagar tudo</button></div>
+      ${(() => { const c = Sync.conflictBackup(); return c ? `<p class="small muted">Backup de conflito de sincronização (versão ${esc(c.origin)}, ${new Date(c.at).toLocaleString('pt-BR')}): <button class="btn small" data-action="restore-conflict">Restaurar</button> <button class="btn small ghost" data-action="clear-conflict">Descartar</button></p>` : ''; })()}
     </div>
   </div>`;
 }
@@ -941,7 +991,7 @@ async function handleInvestFile(file) {
 
 /* ================================================================ demo data */
 function loadDemo() {
-  if (state.transactions.length && !confirm('Isso vai substituir seus dados atuais pelos dados de exemplo. Continuar?')) return;
+  if ((state.transactions.length || Sync.enabled()) && !confirm('Isso vai substituir seus dados atuais pelos dados de exemplo' + (Sync.enabled() ? ' — também na nuvem e nos outros aparelhos sincronizados' : '') + '. Continuar?')) return;
   let seed = 42; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
   const s = defaultState();
   s.settings.name = state.settings.name;
@@ -1167,8 +1217,57 @@ const actions = {
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `financas-backup-${todayISO()}.json`; a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   },
-  reset: () => { if (confirm('Apagar TODOS os dados? Exporte um backup antes.')) { state = defaultState(); save(); render(); } },
-  'modal-cancel': () => $('#modal').close(),
+  reset: () => { if (confirm('Apagar TODOS os dados? Exporte um backup antes.' + (Sync.enabled() ? '\n\nA sincronização está ativa: os dados também serão apagados na nuvem e nos outros aparelhos.' : ''))) { state = defaultState(); save(); render(); } },
+  'modal-cancel': () => { ui.pendingSync = null; $('#modal').close(); },
+
+  'sync-connect': async el => {
+    const token = $('#sync-token').value.trim(), password = $('#sync-pass').value;
+    if (!token) return toast('Cole o token do GitHub.');
+    if (password.length < 8) return toast('A senha precisa ter pelo menos 8 caracteres.');
+    el.disabled = true; el.textContent = 'Conectando…';
+    try {
+      const res = await Sync.connect(token, password);
+      if (res.found && hasData(state)) {
+        ui.pendingSync = res;
+        openModal('Já existem dados na nuvem', `<p>Encontrei dados sincronizados (última alteração em ${new Date(res.remote.updatedAt).toLocaleString('pt-BR')}, pelo ${esc(res.remote.device || 'outro aparelho')}). Este aparelho também tem dados. Qual versão você quer manter?</p>
+          <div class="quick quick-grid">
+            <button class="qa" data-action="sync-choose" data-choice="pull"><span class="qa-i">⬇</span>Usar os dados da nuvem</button>
+            <button class="qa" data-action="sync-choose" data-choice="push"><span class="qa-i">⬆</span>Enviar os deste aparelho</button>
+          </div><p class="muted small">A versão descartada fica guardada como backup em Configurações › Backup.</p>`, null, { noSubmit: true });
+        return;
+      }
+      if (res.found) { Sync.adopt(res); toast('Conectado! Dados baixados da nuvem.'); }
+      else {
+        if (!state.meta?.updatedAt) { state.meta = { ...(state.meta || {}), updatedAt: Date.now() }; persist(); }
+        await Sync.pushLocal(res); toast('Conectado! Seus dados foram enviados (criptografados) para a nuvem.');
+      }
+      render();
+    } catch (e) { toast(e.message, 8000); if (el.isConnected) { el.disabled = false; el.textContent = 'Conectar'; } }
+  },
+  'sync-choose': async el => {
+    const res = ui.pendingSync; ui.pendingSync = null; $('#modal').close();
+    if (!res) return;
+    try {
+      if (el.dataset.choice === 'pull') {
+        try { localStorage.setItem('minhas-financas.backup-conflito', JSON.stringify({ at: Date.now(), origin: 'deste aparelho antes de conectar', state })); } catch { /* */ }
+        Sync.adopt(res); toast('Sincronização ativada com os dados da nuvem.');
+      } else {
+        state.meta = { ...(state.meta || {}), updatedAt: Date.now() }; persist();
+        await Sync.pushLocal(res); toast('Sincronização ativada: dados deste aparelho enviados.');
+      }
+      render();
+    } catch (e) { toast(e.message, 8000); }
+  },
+  'sync-now': () => Sync.syncNow().then(() => { if (ui.view === 'settings') render(); }),
+  'sync-disconnect': () => {
+    if (!confirm('Desconectar este aparelho da sincronização? Os dados continuam aqui e a nuvem não é apagada.')) return;
+    Sync.disconnect(); render();
+  },
+  'restore-conflict': () => {
+    const c = Sync.conflictBackup(); if (!c || !confirm('Substituir os dados atuais pelo backup de conflito?')) return;
+    state = normalizeState(c.state); Sync.clearConflictBackup(); save(); render(); toast('Backup restaurado.');
+  },
+  'clear-conflict': () => { Sync.clearConflictBackup(); render(); },
 };
 
 function accountForm(a = {}) {
@@ -1220,7 +1319,7 @@ document.addEventListener('change', e => {
     if (el.id === 'file-bank') handleBankFiles(files);
     else if (el.id === 'file-invest') handleInvestFile(files[0]);
     else if (el.id === 'file-backup') files[0].text().then(t => {
-      try { const s = JSON.parse(t); if (!s.transactions) throw new Error('formato inválido'); state = { ...defaultState(), ...s }; save(); render(); toast('Backup restaurado.'); }
+      try { const s = JSON.parse(t); if (!s.transactions) throw new Error('formato inválido'); state = normalizeState(s); save(); render(); toast('Backup restaurado.'); }
       catch (err) { toast('Erro ao ler backup: ' + err.message); }
     });
     return;
@@ -1258,6 +1357,15 @@ document.addEventListener('input', e => {
 }));
 
 /* ================================================================== boot */
-const generated = runRecurring();
+Sync.init({
+  getState: () => state,
+  applyRemote: data => { state = normalizeState(data); persist(); render(); },
+  onStatus: renderSyncStatus,
+});
 render();
-if (generated) toast(`${generated} lançamento(s) recorrente(s) gerado(s) automaticamente.`);
+(async () => {
+  // Baixa as novidades da nuvem antes de gerar os recorrentes, para os aparelhos não brigarem.
+  if (Sync.enabled()) await Sync.syncNow();
+  const generated = runRecurring();
+  if (generated) { render(); toast(`${generated} lançamento(s) recorrente(s) gerado(s) automaticamente.`); }
+})();

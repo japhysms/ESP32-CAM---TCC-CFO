@@ -44,10 +44,24 @@ Roda 100% no navegador, sem servidor e sem instalação: **abra o `index.html`**
 
 Arquivos de teste em [`exemplos/`](exemplos/).
 
+## Sincronização entre aparelhos (PC ↔ celular)
+
+Por padrão os dados ficam no `localStorage` do navegador de cada aparelho. Para usar os mesmos dados em todos:
+
+1. Crie um token em <https://github.com/settings/tokens/new?scopes=gist&description=Minhas%20Finan%C3%A7as> com **somente a permissão `gist`** (Expiration: *No expiration*, ou renove quando vencer).
+2. No app, vá em **Configurações › Sincronização**, cole o token e crie uma **senha de sincronização**.
+3. Em cada outro aparelho, faça o mesmo com **o mesmo token e a mesma senha** — o app encontra os dados sozinho.
+
+Como funciona:
+- Os dados são comprimidos e **criptografados no próprio aparelho** (PBKDF2 + AES‑256‑GCM) com a sua senha e guardados num **Gist secreto** da sua conta do GitHub. O GitHub só vê texto cifrado.
+- Cada alteração é enviada ~3 s depois; ao abrir o app ou voltar para ele, as novidades são baixadas. O indicador ☁ no topo mostra o estado.
+- Se os dois aparelhos mudarem ao mesmo tempo sem conexão, vale a versão mais recente e a outra fica guardada em **Configurações › Backup** para restaurar.
+- **Se esquecer a senha, os dados da nuvem não podem ser abertos** (os de cada aparelho continuam lá). Token e senha ficam salvos só no aparelho.
+
 ## Dados e privacidade
 
-Os dados ficam apenas no `localStorage` do seu navegador — nada é enviado para servidores (exceto os tickers, ao buscar cotações).
-Use **Configurações › Backup › Exportar JSON** com frequência e **Restaurar JSON** para levar para outro computador.
+Sem sincronização, nada sai do navegador (exceto os tickers, ao buscar cotações). Com ela, só sai o arquivo criptografado.
+Use **Configurações › Backup › Exportar JSON** de vez em quando como cópia de segurança extra.
 
 ## Arquivos
 
@@ -57,3 +71,4 @@ Use **Configurações › Backup › Exportar JSON** com frequência e **Restaur
 | `styles.css` | visual (claro/escuro automático, responsivo) |
 | `app.js` | estado, cálculos, telas, regras, recorrências, carteira e cotações |
 | `importers.js` | leitores de OFX, CSV bancário e CSV de operações |
+| `sync.js` | sincronização criptografada via GitHub Gist |

@@ -256,3 +256,12 @@ dialog form { padding: 20px; }
   .kpi { padding: 14px; }
   .kpi .value { font-size: 17px; }
 }
+
+/* ---------- sincronização ---------- */
+.top-right { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+.top-right .hide-btn { margin-left: 0; }
+.sync-chip { border: 0; background: var(--soft); color: var(--muted); font-size: 12px; padding: 5px 10px; border-radius: 99px; cursor: pointer; white-space: nowrap; }
+.sync-chip.ok { color: var(--green); }
+.sync-chip.error { color: var(--red); }
+.how-to { padding-left: 18px; line-height: 1.6; margin: 12px 0 16px; }
+.how-to a { color: var(--blue); }

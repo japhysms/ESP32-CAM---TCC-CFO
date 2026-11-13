@@ -16,7 +16,10 @@
       <button data-action="nav" data-view="import">Importar</button>
       <button data-action="nav" data-view="settings">Configurações</button>
     </nav>
-    <button class="icon-btn hide-btn" id="hide-btn" data-action="toggle-hide" title="Esconder / mostrar valores">👁</button>
+    <div class="top-right">
+      <button class="sync-chip" id="sync-status" data-action="nav" data-view="settings" hidden></button>
+      <button class="icon-btn hide-btn" id="hide-btn" data-action="toggle-hide" title="Esconder / mostrar valores">👁</button>
+    </div>
   </header>
 
   <main id="app"></main>
@@ -43,6 +46,7 @@
   <div id="toast" class="toast" hidden></div>
 
   <script src="importers.js"></script>
+  <script src="sync.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
