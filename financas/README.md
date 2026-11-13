@@ -10,6 +10,13 @@ Roda 100% no navegador, sem servidor e sem instalação: **abra o `index.html`**
 - *Saídas por dia*: calendário de calor mostrando quanto saiu em cada dia (clique num dia para ver as transações)
 - *Por tags*: rosca de despesas/receitas por categoria (clique numa tag para filtrar)
 - Receitas × despesas dos últimos 6 meses, resumo dos investimentos e maiores gastos do mês
+- **Minhas contas**: saldo de cada conta e saldo geral; **cartões** com limite disponível e fatura atual; botão *Ajustar saldos* para bater com o app do banco
+- **Metas do mês**: limite de gasto por tag com barra de progresso (sugere valores pela média dos últimos 3 meses)
+- **Equilíbrio financeiro**: regra 50/30/20 — essenciais até 50% da receita, não essenciais até 30%, investimentos no mínimo 20%
+- **Acesso rápido**: lançar despesa, receita, transferência entre contas ou investimento
+- **Primeiros passos**: checklist de configuração com progresso
+- 👁 **Esconder valores** com um clique (para abrir em público)
+- No celular: navegação inferior com botão ＋ para lançamentos rápidos
 
 **Investimentos**
 - Carteira consolidada: preço médio, custo, valor atual, resultado (R$ e %) e peso de cada ativo

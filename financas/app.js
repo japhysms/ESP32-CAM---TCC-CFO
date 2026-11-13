@@ -8,7 +8,10 @@ const pad = n => String(n).padStart(2, '0');
 const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-4);
 const BRL = new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' });
 const NUM = new Intl.NumberFormat('pt-BR', { maximumFractionDigits: 8 });
-const fmt = v => BRL.format(v || 0);
+const PREFS_KEY = 'minhas-financas.prefs';
+const prefs = (() => { try { return JSON.parse(localStorage.getItem(PREFS_KEY)) || {}; } catch { return {}; } })();
+function savePrefs() { try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch { /* navegação privada */ } }
+const fmt = v => (prefs.hide ? 'R$ •••••' : BRL.format(v || 0));
 const fmtNum = v => NUM.format(v || 0);
 const pct = v => (isFinite(v) ? (v * 100).toFixed(1).replace('.', ',') : '0,0') + '%';
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -17,6 +20,7 @@ const round2 = v => Math.round(v * 100) / 100;
 const sum = (arr, f = x => x) => arr.reduce((a, x) => a + f(x), 0);
 
 function fmtShort(v) {
+  if (prefs.hide) return '•••';
   const a = Math.abs(v);
   if (a >= 1e6) return 'R$ ' + (v / 1e6).toFixed(1).replace('.', ',') + 'mi';
   if (a >= 1e3) return 'R$ ' + (v / 1e3).toFixed(1).replace('.', ',') + 'mil';
@@ -33,11 +37,14 @@ const fmtDate = iso => iso ? iso.split('-').reverse().join('/') : '';
 
 /* ================================================================ defaults */
 const DEFAULT_TAGS = [
-  ['Salário', '#16a34a'], ['Outras receitas', '#65a30d'], ['Investimentos', '#2563eb'], ['Moradia', '#6366f1'],
-  ['Alimentação', '#f59e0b'], ['Transporte', '#0ea5e9'], ['Lazer', '#ec4899'], ['Saúde', '#10b981'],
-  ['Educação', '#8b5cf6'], ['Assinaturas', '#f97316'], ['Compras', '#e11d48'], ['Impostos e taxas', '#78716c'],
-  ['Outros', '#a3a3a3'], ['Transferência', '#64748b', true],
-].map(([name, color, exclude]) => ({ name, color, exclude: !!exclude }));
+  ['Salário', '#16a34a'], ['Outras receitas', '#65a30d'], ['Investimentos', '#2563eb', 'investimento'], ['Moradia', '#6366f1', 'essencial'],
+  ['Alimentação', '#f59e0b', 'essencial'], ['Transporte', '#0ea5e9', 'essencial'], ['Lazer', '#ec4899', 'livre'], ['Saúde', '#10b981', 'essencial'],
+  ['Educação', '#8b5cf6', 'essencial'], ['Assinaturas', '#f97316', 'livre'], ['Compras', '#e11d48', 'livre'], ['Impostos e taxas', '#78716c', 'essencial'],
+  ['Outros', '#a3a3a3', 'livre'], ['Transferência', '#64748b', '', true],
+].map(([name, color, group, exclude]) => ({ name, color, group: group || '', exclude: !!exclude }));
+// Grupos da regra 50/30/20 (equilíbrio financeiro)
+const GROUPS = { essencial: 'Essencial', livre: 'Não essencial', investimento: 'Investimento' };
+const ACC_TYPES = { corrente: 'Conta corrente / poupança', cartao: 'Cartão de crédito', corretora: 'Corretora' };
 const NO_TAG = { name: 'Sem Tags', color: '#cbd5e1' };
 
 // [padrões separados por |, tag, sinal: any | in | out]
@@ -87,10 +94,11 @@ function defaultState() {
   return {
     version: 1,
     settings: { name: '', brapiToken: '' },
-    accounts: [{ id: 'conta', name: 'Conta corrente', type: 'corrente', initialBalance: 0 }],
+    accounts: [{ id: 'conta', name: 'Conta corrente', type: 'corrente', initialBalance: 0, color: '#7c3aed' }],
     tags: DEFAULT_TAGS.map(t => ({ ...t })),
     rules: DEFAULT_RULES.map(r => ({ id: uid(), ...r })),
     recurring: [],
+    budgets: {},
     transactions: [],
     investments: { assets: [], operations: [], history: {} },
   };
@@ -101,7 +109,9 @@ function loadState() {
     if (!raw) return defaultState();
     const s = JSON.parse(raw);
     const d = defaultState();
-    return { ...d, ...s, settings: { ...d.settings, ...s.settings }, investments: { ...d.investments, ...s.investments } };
+    const merged = { ...d, ...s, settings: { ...d.settings, ...s.settings }, investments: { ...d.investments, ...s.investments }, budgets: s.budgets || {} };
+    for (const t of merged.tags) if (t.group === undefined) t.group = DEFAULT_TAGS.find(x => x.name === t.name)?.group || '';
+    return merged;
   } catch (e) { console.error(e); return defaultState(); }
 }
 let state = loadState();
@@ -136,6 +146,28 @@ function suggestTag(description, amount) {
 }
 
 function monthTx(ym) { return state.transactions.filter(t => t.date.startsWith(ym)); }
+
+function accountBalance(a, end = todayISO()) {
+  return (+a.initialBalance || 0) + sum(state.transactions.filter(t => t.accountId === a.id && t.date <= end), t => t.amount);
+}
+const accountColor = a => a.color || { corrente: '#7c3aed', cartao: '#e11d48', corretora: '#2563eb' }[a.type] || '#64748b';
+const initials = name => String(name).split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0]).join('').toUpperCase();
+const avatar = a => `<span class="avatar" style="background:${accountColor(a)}">${esc(initials(a.name))}</span>`;
+
+function spentByTag(ym, tag) {
+  return -sum(monthTx(ym).filter(t => !isExcluded(t) && t.amount < 0 && (t.tag || '') === tag), t => t.amount);
+}
+function avgSpent(tag, ym, n = 3) {
+  return sum(Array.from({ length: n }, (_, i) => spentByTag(addMonths(ym, -i - 1), tag))) / n;
+}
+function balanceGroups(ym) {
+  const g = { essencial: 0, livre: 0, investimento: 0, sem: 0 };
+  for (const t of monthTx(ym)) {
+    if (isExcluded(t) || t.amount >= 0) continue;
+    g[(t.tag && tagInfo(t.tag).group) || 'sem'] += -t.amount;
+  }
+  return g;
+}
 
 function monthSummary(ym) {
   const txs = monthTx(ym).filter(t => !isExcluded(t));
@@ -359,7 +391,8 @@ function emptyState() {
 
 function viewOverview() {
   const s = monthSummary(ui.month);
-  const head = `<div class="page-head"><div><h1>${greeting()}</h1><p>O que está acontecendo hoje?</p></div>${monthPicker()}</div>`;
+  const head = `<div class="page-head"><div><h1>${greeting()}</h1><p>O que está acontecendo hoje?</p></div>
+    <div class="toolbar">${quickActions()}${monthPicker()}</div></div>` + onboardingCard();
   if (!state.transactions.length && !state.investments.operations.length) return head + emptyState();
 
   const kpis = `<div class="grid kpis">
@@ -418,7 +451,112 @@ function viewOverview() {
     ${top.length ? top.map(t => `<div class="list-row"><span class="dot" style="background:${tagInfo(t.tag).color}"></span><span class="grow">${esc(t.description)}<br><span class="muted small">${fmtDate(t.date)} · ${esc(tagInfo(t.tag).name)}</span></span><span class="neg">${fmt(t.amount)}</span></div>`).join('') : '<p class="muted">Nenhum gasto no mês.</p>'}
   </div>`;
 
-  return head + kpis + `<div class="grid two">${heat}${tags}</div><div class="grid two">${evo}${side}</div>`;
+  return head + kpis + `<div class="grid two">${heat}${tags}</div>
+    <div class="grid two">${accountsCard()}<div class="stack">${goalsCard()}${balanceCard()}</div></div>
+    <div class="grid two">${evo}${side}</div>`;
+}
+
+function quickActions(menu = false) {
+  return `<div class="quick ${menu ? 'quick-grid' : ''}">
+    <button class="qa" data-action="quick-tx" data-kind="out"><span class="qa-i neg">−</span>Despesa</button>
+    <button class="qa" data-action="quick-tx" data-kind="in"><span class="qa-i pos">+</span>Receita</button>
+    <button class="qa" data-action="transfer"><span class="qa-i">⇄</span>Transferência</button>
+    <button class="qa" data-action="add-op"><span class="qa-i">↗</span>Investimento</button>
+    ${menu ? '<button class="qa" data-action="nav" data-view="import"><span class="qa-i">⬆</span>Importar extrato</button>' : ''}
+  </div>`;
+}
+
+function onboardingSteps() {
+  return [
+    { label: 'Cadastrar suas contas e cartões', done: state.accounts.length > 1 || state.accounts.some(a => +a.initialBalance), go: 'settings' },
+    { label: 'Importar um extrato do banco', done: state.transactions.some(t => t.source === 'importado'), go: 'import' },
+    { label: 'Categorizar todas as transações', done: state.transactions.length > 0 && !state.transactions.some(t => !t.tag), go: 'transactions' },
+    { label: 'Registrar seus investimentos', done: state.investments.operations.length > 0, go: 'investments' },
+    { label: 'Definir metas do mês', done: Object.values(state.budgets || {}).some(v => +v > 0), go: 'budgets' },
+  ];
+}
+function onboardingCard() {
+  if (prefs.hideOnboarding) return '';
+  const st = onboardingSteps(); const n = st.filter(x => x.done).length;
+  if (n === st.length) return '';
+  const next = st.find(x => !x.done);
+  return `<div class="card onboarding"><div class="ob-icon">✨</div>
+    <div class="grow"><strong>Primeiros passos</strong>
+      <div class="small muted"><strong class="pos">${n}</strong> de ${st.length} tarefas completas · próximo: ${esc(next.label)}</div>
+      <div class="steps">${st.map(x => `<span class="${x.done ? 'done' : ''}" title="${esc(x.label)}"></span>`).join('')}</div></div>
+    <button class="btn soft" data-action="onboarding-go" data-go="${next.go}">Continuar</button>
+    <button class="icon-btn" data-action="hide-onboarding" title="Dispensar">✕</button></div>`;
+}
+
+function accountsCard() {
+  const banks = state.accounts.filter(a => a.type !== 'cartao');
+  const cards = state.accounts.filter(a => a.type === 'cartao');
+  const total = sum(banks, a => accountBalance(a));
+  const cardHTML = a => {
+    const fat = Math.max(0, -accountBalance(a)); const lim = +a.limit || 0;
+    return `<div class="cc">
+      <div class="list-row">${avatar(a)}<span class="grow"><strong>${esc(a.name)}</strong><br><span class="muted small">Cartão de crédito</span></span>
+        <button class="btn small soft" data-action="goto-account" data-id="${a.id}">ver fatura</button></div>
+      <div class="cc-nums"><div><span class="muted small">Disponível</span><br><strong>${lim ? fmt(lim - fat) : '—'}</strong></div>
+        <div><span class="muted small">Fatura atual</span><br><strong class="neg">${fmt(fat)}</strong></div></div>
+      ${lim ? `<div class="bar cc-bar"><span style="width:${Math.min(100, (fat / lim) * 100)}%;background:var(--red)"></span></div>` : ''}</div>`;
+  };
+  return `<div class="card">
+    <div class="card-head"><div><h2>Minhas contas</h2><div class="sub">saldo geral hoje</div></div><button class="btn small" data-action="adjust-balances">Ajustar saldos</button></div>
+    <div class="big-number">${fmt(total)}</div>
+    ${banks.map(a => `<div class="list-row clickable" data-action="goto-account" data-id="${a.id}">${avatar(a)}<span class="grow"><strong>${esc(a.name)}</strong><br><span class="muted small">${ACC_TYPES[a.type]}</span></span><span class="acc-val">${fmt(accountBalance(a))}</span></div>`).join('')}
+    ${cards.length ? `<h2 class="mt">Cartões de crédito</h2>${cards.map(cardHTML).join('')}` : `<p class="muted small mt">Cadastre seus cartões em Configurações para acompanhar limite e fatura.</p>`}
+  </div>`;
+}
+
+function goalsCard() {
+  const entries = Object.entries(state.budgets || {}).filter(([, v]) => +v > 0)
+    .map(([tag, lim]) => ({ tag, lim: +lim, spent: spentByTag(ui.month, tag) }))
+    .sort((a, b) => b.spent / b.lim - a.spent / a.lim);
+  const head = `<div class="card-head"><div><h2>Metas de ${MONTHS[+ui.month.slice(5) - 1]}</h2><div class="sub">limite de gastos por tag</div></div>
+    <button class="btn small" data-action="edit-budgets">${entries.length ? 'Editar' : 'Definir metas'}</button></div>`;
+  if (!entries.length) return `<div class="card">${head}<p class="muted">Defina quanto quer gastar por categoria no mês — o app sugere valores pela sua média dos últimos 3 meses.</p></div>`;
+  return `<div class="card">${head}${entries.map(({ tag, lim, spent }) => {
+    const r = spent / lim;
+    const color = r > 1 ? 'var(--red)' : r > 0.8 ? 'var(--amber)' : 'var(--green)';
+    return `<div class="goal"><div class="goal-top"><span><span class="dot" style="background:${tagInfo(tag).color}"></span> ${esc(tag)}</span>
+      <span class="small">${fmt(spent)} <span class="muted">de ${fmt(lim)}</span></span></div>
+      <div class="bar"><span style="width:${Math.min(100, r * 100)}%;background:${color}"></span></div>
+      <div class="small ${r > 1 ? 'neg' : 'muted'}">${r > 1 ? `estourou em ${fmt(spent - lim)}` : `restam ${fmt(lim - spent)}`}</div></div>`;
+  }).join('')}</div>`;
+}
+
+function balanceCard() {
+  const inc = monthSummary(ui.month).receitas; const g = balanceGroups(ui.month);
+  const row = (label, value, share, min = false) => {
+    const target = inc * share; const r = target ? value / target : 0;
+    const color = min ? (r >= 1 ? 'var(--green)' : 'var(--amber)') : (r <= 0.9 ? 'var(--green)' : r <= 1 ? 'var(--amber)' : 'var(--red)');
+    return `<div class="goal"><div class="goal-top"><span>${label}</span><strong class="small">${fmt(value)} <span class="muted">· ${pct(inc ? value / inc : 0)}</span></strong></div>
+      <div class="bar"><span style="width:${Math.min(100, r * 100)}%;background:${color}"></span></div>
+      <div class="small muted">${min ? 'Mínimo' : 'Limite'} recomendado: ${fmt(target)} (${share * 100}% da receita)</div></div>`;
+  };
+  return `<div class="card"><h2>Equilíbrio financeiro</h2><div class="sub">regra 50/30/20 sobre as receitas do mês · grupo de cada tag em Configurações</div>
+    ${inc ? row('Gastos essenciais', g.essencial, 0.5) + row('Gastos não essenciais', g.livre, 0.3) + row('Investimentos', g.investimento, 0.2, true) : '<p class="muted">Sem receitas no mês.</p>'}
+    ${g.sem ? `<p class="small muted">${fmt(g.sem)} em gastos sem tag (ou tag sem grupo) não entram na conta.</p>` : ''}</div>`;
+}
+
+function quickTxForm(out) {
+  return `<div class="form-grid">
+    <label>Valor (R$)<input type="number" step="0.01" min="0" name="value" required autofocus></label>
+    <label>Data<input type="date" name="date" required value="${todayISO()}"></label>
+    <label class="full">Descrição<input type="text" name="description" required placeholder="${out ? 'Mercado, Uber, farmácia…' : 'Salário, freela, reembolso…'}"></label>
+    <label>Tag<select name="tag"><option value="">Automática (pelas regras)</option>${state.tags.map(t => `<option>${esc(t.name)}</option>`).join('')}</select></label>
+    <label>Conta<select name="accountId">${accountOptions((out && state.accounts.find(a => a.type === 'cartao')?.id) || state.accounts[0]?.id)}</select></label>
+  </div>`;
+}
+function transferForm() {
+  const [a, b] = state.accounts;
+  return `<div class="form-grid">
+    <label>De<select name="from">${accountOptions(a?.id)}</select></label>
+    <label>Para<select name="to">${accountOptions((b || a)?.id)}</select></label>
+    <label>Valor (R$)<input type="number" step="0.01" min="0" name="value" required></label>
+    <label>Data<input type="date" name="date" required value="${todayISO()}"></label>
+  </div><p class="muted small">Transferências e pagamentos de fatura não contam como receita nem despesa — só movem saldo entre suas contas.</p>`;
 }
 
 function filteredTx() {
@@ -602,7 +740,7 @@ function viewSettings() {
       <p class="muted small">Sem token, a brapi só cota alguns ativos de teste. Crie um token gratuito em brapi.dev. Cripto usa a CoinGecko (sem token).</p>
     </div>
     <div class="card"><div class="card-head"><h2>Contas</h2><button class="btn small" data-action="add-account">+ Conta</button></div>
-      ${state.accounts.map(a => `<div class="list-row"><span class="grow"><strong>${esc(a.name)}</strong><br><span class="muted small">${accTypes[a.type]} · saldo inicial ${fmt(a.initialBalance)}</span></span>
+      ${state.accounts.map(a => `<div class="list-row">${avatar(a)}<span class="grow"><strong>${esc(a.name)}</strong><br><span class="muted small">${accTypes[a.type]} · saldo inicial ${fmt(a.initialBalance)}${a.limit ? ' · limite ' + fmt(a.limit) : ''}</span></span>
         <button class="icon-btn" data-action="edit-account" data-id="${a.id}">✎</button><button class="icon-btn" data-action="del-account" data-id="${a.id}">✕</button></div>`).join('')}
     </div>
     <div class="card"><div class="card-head"><div><h2>Regras automáticas</h2><div class="sub">se a descrição contém… então aplicar a tag (primeira regra que casar vence)</div></div><button class="btn small" data-action="add-rule">+ Regra</button></div>
@@ -616,7 +754,7 @@ function viewSettings() {
         <span class="${r.amount >= 0 ? 'pos' : 'neg'}">${fmt(r.amount)}</span><button class="icon-btn" data-action="edit-rec" data-id="${r.id}">✎</button><button class="icon-btn" data-action="del-rec" data-id="${r.id}">✕</button></div>`).join('') : '<p class="muted">Nenhum lançamento recorrente.</p>'}
     </div>
     <div class="card"><div class="card-head"><h2>Tags</h2><button class="btn small" data-action="add-tag">+ Tag</button></div>
-      ${state.tags.map(t => `<div class="list-row"><span class="dot" style="background:${t.color}"></span><span class="grow">${esc(t.name)}${t.exclude ? ' <span class="muted small">(fora de receitas/despesas)</span>' : ''}</span>
+      ${state.tags.map(t => `<div class="list-row"><span class="dot" style="background:${t.color}"></span><span class="grow">${esc(t.name)}${t.exclude ? ' <span class="muted small">(fora de receitas/despesas)</span>' : ''}${t.group ? ` <span class="muted small">· ${GROUPS[t.group]}</span>` : ''}</span>
         <button class="icon-btn" data-action="edit-tag" data-name="${esc(t.name)}">✎</button><button class="icon-btn" data-action="del-tag" data-name="${esc(t.name)}">✕</button></div>`).join('')}
     </div>
     <div class="card"><h2>Backup</h2><div class="sub">Os dados ficam só neste navegador. Exporte com frequência.</div>
@@ -629,19 +767,21 @@ function viewSettings() {
 
 const VIEWS = { overview: viewOverview, transactions: viewTransactions, investments: viewInvestments, import: viewImport, settings: viewSettings };
 function render() {
-  document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.view === ui.view));
+  document.querySelectorAll('#tabs button, #bottom-nav button[data-view]').forEach(b => b.classList.toggle('active', b.dataset.view === ui.view));
+  $('#hide-btn').textContent = prefs.hide ? '🙈' : '👁';
   $('#app').innerHTML = VIEWS[ui.view]();
 }
 
 /* =============================================================== modal/toast */
 let modalSubmit = null;
-function openModal(title, body, onSubmit, { submitLabel = 'Salvar', onOpen } = {}) {
+function openModal(title, body, onSubmit, { submitLabel = 'Salvar', onOpen, noSubmit = false } = {}) {
   const dlg = $('#modal');
   dlg.querySelector('.modal-title').textContent = title;
   dlg.querySelector('.modal-body').innerHTML = body;
   dlg.querySelector('button[type=submit]').textContent = submitLabel;
+  dlg.querySelector('button[type=submit]').hidden = noSubmit;
   modalSubmit = onSubmit;
-  dlg.showModal();
+  if (!dlg.open) dlg.showModal();
   onOpen?.(dlg);
 }
 $('#modal-form').addEventListener('submit', e => {
@@ -807,9 +947,11 @@ function loadDemo() {
   s.settings.name = state.settings.name;
   s.settings.brapiToken = state.settings.brapiToken;
   s.accounts = [
-    { id: 'conta', name: 'Conta corrente', type: 'corrente', initialBalance: 8500 },
-    { id: 'cartao', name: 'Cartão de crédito', type: 'cartao', initialBalance: 0 },
+    { id: 'conta', name: 'Conta corrente', type: 'corrente', initialBalance: 8500, color: '#7c3aed' },
+    { id: 'poupanca', name: 'Poupança', type: 'corrente', initialBalance: 6000, color: '#0ea5e9' },
+    { id: 'cartao', name: 'Cartão de crédito', type: 'cartao', initialBalance: -2600, limit: 9000, color: '#e11d48' },
   ];
+  s.budgets = { 'Alimentação': 1600, 'Transporte': 600, 'Lazer': 350, 'Compras': 300, 'Assinaturas': 100 };
   const tx = (date, description, amount, accountId = 'conta') => s.transactions.push({ id: uid(), date, description, amount: round2(amount), tag: '', accountId, source: 'exemplo' });
   const end = todayISO();
   for (let i = -6; i <= 0; i++) {
@@ -837,6 +979,12 @@ function loadDemo() {
     add(1 + Math.floor(rnd() * 27), 'BAR DO ZE', -80 - rnd() * 150, 'cartao');
     add(1 + Math.floor(rnd() * 27), 'AMAZON MARKETPLACE', -70 - rnd() * 400, 'cartao');
     add(1 + Math.floor(rnd() * 27), 'PIX ENVIADO JOAO SILVA', -50 - rnd() * 200);
+  }
+  // Pagamento de fatura = gastos do cartão no mês anterior
+  for (const t of s.transactions) if (/PAGAMENTO (DE|RECEBIDO) FATURA/.test(t.description)) {
+    const prev = addMonths(t.date.slice(0, 7), -1);
+    const spent = -sum(s.transactions.filter(x => x.accountId === 'cartao' && x.amount < 0 && x.date.startsWith(prev)), x => x.amount);
+    t.amount = round2(t.description.includes('RECEBIDO') ? (spent || 2600) : -(spent || 2600));
   }
   s.transactions.forEach(t => { t.tag = suggestTagWith(s.rules, t.description, t.amount); });
   s.recurring.push({ id: uid(), description: 'SALARIO EMPRESA XYZ LTDA', amount: 12500, tag: 'Salário', accountId: 'conta', day: 5, startMonth: addMonths(currentMonth(), 1), generated: [] });
@@ -866,7 +1014,55 @@ function suggestTagWith(rules, desc, amount) { const old = state.rules; state.ru
 
 /* ================================================================ actions */
 const actions = {
-  nav: el => { ui.view = el.dataset.view; render(); window.scrollTo(0, 0); },
+  nav: el => { if ($('#modal').open) $('#modal').close(); ui.view = el.dataset.view; render(); window.scrollTo(0, 0); },
+  'toggle-hide': () => { prefs.hide = !prefs.hide; savePrefs(); render(); },
+  'hide-onboarding': () => { prefs.hideOnboarding = true; savePrefs(); render(); },
+  'onboarding-go': el => { if (el.dataset.go === 'budgets') return actions['edit-budgets'](); ui.view = el.dataset.go; render(); window.scrollTo(0, 0); },
+  'goto-account': el => { ui.filters = { month: '__all', q: '', tag: '__all', account: el.dataset.id, day: '' }; ui.view = 'transactions'; render(); window.scrollTo(0, 0); },
+  'quick-menu': () => openModal('O que você quer lançar?', quickActions(true), null, { noSubmit: true }),
+  'quick-tx': el => {
+    const out = el.dataset.kind === 'out';
+    openModal(out ? 'Nova despesa' : 'Nova receita', quickTxForm(out), d => {
+      const v = Math.abs(+d.value); if (!v) { toast('Informe o valor.'); return false; }
+      const amount = round2(out ? -v : v);
+      state.transactions.push({ id: uid(), date: d.date, description: d.description.trim(), amount, tag: d.tag || suggestTag(d.description, amount), accountId: d.accountId, source: 'manual' });
+      toast(out ? 'Despesa lançada.' : 'Receita lançada.');
+    });
+  },
+  transfer: () => openModal('Transferência entre contas', transferForm(), d => {
+    if (d.from === d.to) { toast('Escolha contas diferentes.'); return false; }
+    const v = round2(Math.abs(+d.value)); if (!v) { toast('Informe o valor.'); return false; }
+    const from = account(d.from), to = account(d.to);
+    state.transactions.push(
+      { id: uid(), date: d.date, description: `Transferência para ${to.name}`, amount: -v, tag: 'Transferência', accountId: from.id, source: 'manual' },
+      { id: uid(), date: d.date, description: `Transferência de ${from.name}`, amount: v, tag: 'Transferência', accountId: to.id, source: 'manual' });
+  }),
+  'adjust-balances': () => openModal('Ajustar saldos',
+    `<p class="muted small">Informe o saldo que aparece hoje no app de cada banco (para cartões, o valor da fatura atual). O saldo inicial da conta é corrigido para bater, sem criar transações.</p>
+    <div class="form-grid">${state.accounts.map(a => `<label>${esc(a.name)}${a.type === 'cartao' ? ' — fatura atual' : ''}<input type="number" step="0.01" name="acc_${a.id}" value="${round2(a.type === 'cartao' ? Math.max(0, -accountBalance(a)) : accountBalance(a))}"></label>`).join('')}</div>`,
+    d => {
+      for (const a of state.accounts) {
+        const v = d['acc_' + a.id]; if (v === '' || v === undefined) continue;
+        const target = a.type === 'cartao' ? -Math.abs(+v) : +v;
+        a.initialBalance = round2((+a.initialBalance || 0) + target - accountBalance(a));
+      }
+      toast('Saldos ajustados.');
+    }),
+  'edit-budgets': () => {
+    const tags = state.tags.filter(t => !t.exclude && (t.group === 'essencial' || t.group === 'livre'));
+    openModal('Metas mensais de gastos', `<p class="muted small">Deixe em branco as tags sem meta. A dica em cada campo é sua média dos últimos 3 meses.</p>
+      <div class="form-grid">${tags.map((t, i) => { const avg = avgSpent(t.name, currentMonth()); return `<label><span><span class="dot" style="background:${t.color}"></span> ${esc(t.name)}</span>
+        <input type="number" step="1" min="0" name="b_${i}" value="${state.budgets?.[t.name] ?? ''}" placeholder="${avg ? 'média ' + Math.round(avg) : ''}"></label>`; }).join('')}
+        <label class="check full"><input type="checkbox" name="fillAvg"> Preencher as vazias com a média dos últimos 3 meses</label></div>`, d => {
+      const b = {};
+      tags.forEach((t, i) => {
+        let v = d['b_' + i];
+        if ((v === '' || v === undefined) && d.fillAvg) { const avg = avgSpent(t.name, currentMonth()); if (avg > 0) v = Math.ceil(avg / 10) * 10; }
+        if (v !== '' && v !== undefined && +v > 0) b[t.name] = +v;
+      });
+      state.budgets = b;
+    });
+  },
   'month-prev': () => { ui.month = addMonths(ui.month, -1); render(); },
   'month-next': () => { ui.month = addMonths(ui.month, 1); render(); },
   donut: el => { ui.donutMode = el.dataset.mode; render(); },
@@ -896,8 +1092,8 @@ const actions = {
   'del-rule': el => { state.rules = state.rules.filter(r => r.id !== el.dataset.id); save(); render(); },
   'rule-up': el => { const i = +el.dataset.idx; if (i > 0) { [state.rules[i - 1], state.rules[i]] = [state.rules[i], state.rules[i - 1]]; save(); render(); } },
 
-  'add-account': () => openModal('Nova conta', accountForm(), d => { state.accounts.push({ id: uid(), name: d.name, type: d.type, initialBalance: +d.initialBalance || 0 }); }),
-  'edit-account': el => { const a = account(el.dataset.id); openModal('Editar conta', accountForm(a), d => { Object.assign(a, { name: d.name, type: d.type, initialBalance: +d.initialBalance || 0 }); }); },
+  'add-account': () => openModal('Nova conta', accountForm(), d => { state.accounts.push({ id: uid(), name: d.name, type: d.type, initialBalance: +d.initialBalance || 0, limit: +d.limit || 0, color: d.color }); }),
+  'edit-account': el => { const a = account(el.dataset.id); openModal('Editar conta', accountForm(a), d => { Object.assign(a, { name: d.name, type: d.type, initialBalance: +d.initialBalance || 0, limit: +d.limit || 0, color: d.color }); }); },
   'del-account': el => {
     if (state.accounts.length === 1) return toast('Mantenha pelo menos uma conta.');
     const n = state.transactions.filter(t => t.accountId === el.dataset.id).length;
@@ -907,11 +1103,12 @@ const actions = {
     save(); render();
   },
 
-  'add-tag': () => openModal('Nova tag', tagForm(), d => { if (state.tags.some(t => t.name === d.name.trim())) { toast('Já existe.'); return false; } state.tags.push({ name: d.name.trim(), color: d.color, exclude: d.exclude }); }),
+  'add-tag': () => openModal('Nova tag', tagForm(), d => { if (state.tags.some(t => t.name === d.name.trim())) { toast('Já existe.'); return false; } state.tags.push({ name: d.name.trim(), color: d.color, group: d.group, exclude: d.exclude }); }),
   'edit-tag': el => {
     const t = state.tags.find(x => x.name === el.dataset.name); const old = t.name;
     openModal('Editar tag', tagForm(t), d => {
-      const name = d.name.trim(); Object.assign(t, { name, color: d.color, exclude: d.exclude });
+      const name = d.name.trim(); Object.assign(t, { name, color: d.color, group: d.group, exclude: d.exclude });
+      if (name !== old && state.budgets?.[old] !== undefined) { state.budgets[name] = state.budgets[old]; delete state.budgets[old]; }
       if (name !== old) { state.transactions.forEach(x => { if (x.tag === old) x.tag = name; }); state.rules.forEach(x => { if (x.tag === old) x.tag = name; }); state.recurring.forEach(x => { if (x.tag === old) x.tag = name; }); }
     });
   },
@@ -982,12 +1179,15 @@ function accountForm(a = {}) {
       <option value="cartao" ${a.type === 'cartao' ? 'selected' : ''}>Cartão de crédito</option>
       <option value="corretora" ${a.type === 'corretora' ? 'selected' : ''}>Corretora</option></select></label>
     <label>Saldo inicial (R$)<input type="number" step="0.01" name="initialBalance" value="${a.initialBalance ?? 0}"></label>
+    <label>Limite do cartão (R$)<input type="number" step="0.01" name="limit" value="${a.limit || ''}" placeholder="só para cartões"></label>
+    <label>Cor<input type="color" name="color" value="${a.color || accountColor(a)}" style="height:38px"></label>
   </div><p class="muted small">"Saldo em conta" soma apenas contas corrente/poupança: saldo inicial + transações até o fim do mês.</p>`;
 }
 function tagForm(t = {}) {
   return `<div class="form-grid">
     <label>Nome<input type="text" name="name" required value="${esc(t.name || '')}"></label>
     <label>Cor<input type="color" name="color" value="${t.color || '#2563eb'}" style="height:38px"></label>
+    <label class="full">Grupo (equilíbrio 50/30/20)<select name="group">${[['', 'Nenhum (receitas, transferências)'], ['essencial', 'Essencial — até 50% da receita'], ['livre', 'Não essencial — até 30%'], ['investimento', 'Investimento — mínimo 20%']].map(([v, l]) => `<option value="${v}" ${(t.group || '') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
     <label class="check full"><input type="checkbox" name="exclude" ${t.exclude ? 'checked' : ''}> Não contar como receita/despesa (ex.: transferências entre contas, pagamento de fatura)</label>
   </div>`;
 }
